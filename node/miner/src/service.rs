@@ -4,7 +4,6 @@ use crate::submitter::Submitter;
 use crate::{config::MinerConfig, mine::PoraService, watcher::MineContextWatcher};
 use network::NetworkMessage;
 use std::sync::Arc;
-use storage::config::ShardConfig;
 use storage::log_store::Store;
 use tokio::sync::mpsc;
 use tokio::sync::{broadcast, RwLock};
@@ -17,9 +16,6 @@ pub enum MinerMessage {
     /// Change mining range
     SetStartPosition(Option<u64>),
     SetEndPosition(Option<u64>),
-
-    /// Change shard config
-    SetShardConfig(ShardConfig),
 }
 
 pub struct MineService;

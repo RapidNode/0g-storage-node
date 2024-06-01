@@ -7,7 +7,6 @@ use network::{
     self, Keypair, NetworkConfig, NetworkGlobals, NetworkMessage, RequestId,
     Service as LibP2PService,
 };
-use pruner::{Pruner, PrunerConfig};
 use router::RouterService;
 use rpc::RPCConfig;
 use std::sync::Arc;
@@ -50,8 +49,6 @@ struct LogSyncComponents {
     send: broadcast::Sender<LogSyncEvent>,
 }
 
-struct PrunerComponents {}
-
 /// Builds a `Client` instance.
 ///
 /// ## Notes
@@ -68,7 +65,6 @@ pub struct ClientBuilder {
     sync: Option<SyncComponents>,
     miner: Option<MinerComponents>,
     log_sync: Option<LogSyncComponents>,
-    pruner: Option<PrunerComponents>,
 }
 
 impl ClientBuilder {
@@ -175,19 +171,6 @@ impl ClientBuilder {
             self.miner = Some(MinerComponents { send });
         }
 
-        Ok(self)
-    }
-
-    pub async fn with_pruner(mut self, config: Option<PrunerConfig>) -> Result<Self, String> {
-        if let Some(config) = config {
-            let miner_send = self.miner.as_ref().map(|miner| miner.send.clone());
-            let store = require!("pruner", self, store).clone();
-            let executor = require!("pruner", self, runtime_context).clone().executor;
-            Pruner::spawn(executor, config, store, miner_send)
-                .await
-                .map_err(|e| e.to_string())?;
-            self.pruner = Some(PrunerComponents {});
-        }
         Ok(self)
     }
 

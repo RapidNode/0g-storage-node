@@ -1,4 +1,3 @@
-use crate::config::ShardConfig;
 use append_merkle::MerkleTreeInitialData;
 use ethereum_types::H256;
 use shared_types::{
@@ -145,9 +144,8 @@ pub trait LogStoreChunkWrite {
         maybe_file_proof: Option<FlowProof>,
     ) -> Result<bool>;
 
-    /// Delete a list of chunk batches from the db.
-    /// `batch_list` is a `Vec` of entry batch index.
-    fn remove_chunks_batch(&self, batch_list: &[u64]) -> Result<()>;
+    /// Delete all chunks of a tx.
+    fn remove_all_chunks(&self, tx_seq: u64) -> Result<()>;
 }
 
 pub trait LogChunkStore: LogStoreChunkRead + LogStoreChunkWrite + Send + Sync + 'static {}
@@ -195,9 +193,6 @@ pub trait FlowRead {
     fn get_chunk_root_list(&self) -> Result<MerkleTreeInitialData<DataRoot>>;
 
     fn load_sealed_data(&self, chunk_index: u64) -> Result<Option<MineLoadChunk>>;
-
-    // An estimation of the number of entries in the flow db.
-    fn get_num_entries(&self) -> Result<u64>;
 }
 
 pub trait FlowWrite {
@@ -209,9 +204,6 @@ pub trait FlowWrite {
     /// Remove all the entries after `start_index`.
     /// This is used to remove deprecated data in case of chain reorg.
     fn truncate(&mut self, start_index: u64) -> Result<()>;
-
-    /// Update the shard config.
-    fn update_shard_config(&mut self, shard_config: ShardConfig);
 }
 
 pub struct SealTask {

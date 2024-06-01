@@ -1,0 +1,13 @@
+out/
+cache/
+node_modules/
+.env
+.idea/
+.vscode/
+deploy/*
+typechain-types/
+coverage/
+coverage.json
+
+yarn.lock
+yarn-error.log
