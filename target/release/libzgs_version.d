@@ -1,0 +1,1 @@
+/home/akash/Desktop/RapidNode/0g-storage-node/target/release/libzgs_version.rlib: /home/akash/Desktop/RapidNode/0g-storage-node/.git/index /home/akash/Desktop/RapidNode/0g-storage-node/.git/logs/HEAD /home/akash/Desktop/RapidNode/0g-storage-node/common/zgs_version/src/lib.rs

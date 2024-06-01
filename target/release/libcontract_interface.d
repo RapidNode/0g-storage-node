@@ -1,0 +1,1 @@
+/home/akash/Desktop/RapidNode/0g-storage-node/target/release/libcontract_interface.rlib: /home/akash/Desktop/RapidNode/0g-storage-node/common/contract-interface/../../0g-storage-contracts/artifacts/ /home/akash/Desktop/RapidNode/0g-storage-node/common/contract-interface/build.rs /home/akash/Desktop/RapidNode/0g-storage-node/common/contract-interface/src/lib.rs

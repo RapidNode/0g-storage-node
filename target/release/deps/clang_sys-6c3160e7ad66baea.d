@@ -1,0 +1,14 @@
+/home/akash/Desktop/RapidNode/0g-storage-node/target/release/deps/libclang_sys-6c3160e7ad66baea.rmeta: /home/akash/.cargo/registry/src/index.crates.io-6f17d22bba15001f/clang-sys-1.7.0/src/lib.rs /home/akash/.cargo/registry/src/index.crates.io-6f17d22bba15001f/clang-sys-1.7.0/src/support.rs /home/akash/.cargo/registry/src/index.crates.io-6f17d22bba15001f/clang-sys-1.7.0/src/link.rs /home/akash/Desktop/RapidNode/0g-storage-node/target/release/build/clang-sys-28397f7595be4ae5/out/macros.rs /home/akash/Desktop/RapidNode/0g-storage-node/target/release/build/clang-sys-28397f7595be4ae5/out/common.rs /home/akash/Desktop/RapidNode/0g-storage-node/target/release/build/clang-sys-28397f7595be4ae5/out/dynamic.rs
+
+/home/akash/Desktop/RapidNode/0g-storage-node/target/release/deps/libclang_sys-6c3160e7ad66baea.rlib: /home/akash/.cargo/registry/src/index.crates.io-6f17d22bba15001f/clang-sys-1.7.0/src/lib.rs /home/akash/.cargo/registry/src/index.crates.io-6f17d22bba15001f/clang-sys-1.7.0/src/support.rs /home/akash/.cargo/registry/src/index.crates.io-6f17d22bba15001f/clang-sys-1.7.0/src/link.rs /home/akash/Desktop/RapidNode/0g-storage-node/target/release/build/clang-sys-28397f7595be4ae5/out/macros.rs /home/akash/Desktop/RapidNode/0g-storage-node/target/release/build/clang-sys-28397f7595be4ae5/out/common.rs /home/akash/Desktop/RapidNode/0g-storage-node/target/release/build/clang-sys-28397f7595be4ae5/out/dynamic.rs
+
+/home/akash/Desktop/RapidNode/0g-storage-node/target/release/deps/clang_sys-6c3160e7ad66baea.d: /home/akash/.cargo/registry/src/index.crates.io-6f17d22bba15001f/clang-sys-1.7.0/src/lib.rs /home/akash/.cargo/registry/src/index.crates.io-6f17d22bba15001f/clang-sys-1.7.0/src/support.rs /home/akash/.cargo/registry/src/index.crates.io-6f17d22bba15001f/clang-sys-1.7.0/src/link.rs /home/akash/Desktop/RapidNode/0g-storage-node/target/release/build/clang-sys-28397f7595be4ae5/out/macros.rs /home/akash/Desktop/RapidNode/0g-storage-node/target/release/build/clang-sys-28397f7595be4ae5/out/common.rs /home/akash/Desktop/RapidNode/0g-storage-node/target/release/build/clang-sys-28397f7595be4ae5/out/dynamic.rs
+
+/home/akash/.cargo/registry/src/index.crates.io-6f17d22bba15001f/clang-sys-1.7.0/src/lib.rs:
+/home/akash/.cargo/registry/src/index.crates.io-6f17d22bba15001f/clang-sys-1.7.0/src/support.rs:
+/home/akash/.cargo/registry/src/index.crates.io-6f17d22bba15001f/clang-sys-1.7.0/src/link.rs:
+/home/akash/Desktop/RapidNode/0g-storage-node/target/release/build/clang-sys-28397f7595be4ae5/out/macros.rs:
+/home/akash/Desktop/RapidNode/0g-storage-node/target/release/build/clang-sys-28397f7595be4ae5/out/common.rs:
+/home/akash/Desktop/RapidNode/0g-storage-node/target/release/build/clang-sys-28397f7595be4ae5/out/dynamic.rs:
+
+# env-dep:OUT_DIR=/home/akash/Desktop/RapidNode/0g-storage-node/target/release/build/clang-sys-28397f7595be4ae5/out

@@ -1,5 +1,5 @@
 .DS_Store
-/target
+
 # src/config.rs
 /.idea
 tests/**/__pycache__
