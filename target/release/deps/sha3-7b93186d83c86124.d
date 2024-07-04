@@ -1,0 +1,9 @@
+/root/0g-storage-node/target/release/deps/libsha3-7b93186d83c86124.rmeta: /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/sha3-0.10.8/src/lib.rs /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/sha3-0.10.8/src/macros.rs /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/sha3-0.10.8/src/state.rs
+
+/root/0g-storage-node/target/release/deps/libsha3-7b93186d83c86124.rlib: /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/sha3-0.10.8/src/lib.rs /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/sha3-0.10.8/src/macros.rs /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/sha3-0.10.8/src/state.rs
+
+/root/0g-storage-node/target/release/deps/sha3-7b93186d83c86124.d: /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/sha3-0.10.8/src/lib.rs /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/sha3-0.10.8/src/macros.rs /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/sha3-0.10.8/src/state.rs
+
+/root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/sha3-0.10.8/src/lib.rs:
+/root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/sha3-0.10.8/src/macros.rs:
+/root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/sha3-0.10.8/src/state.rs:

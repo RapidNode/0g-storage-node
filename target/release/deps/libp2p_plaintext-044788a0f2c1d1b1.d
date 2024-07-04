@@ -1,0 +1,12 @@
+/root/0g-storage-node/target/release/deps/liblibp2p_plaintext-044788a0f2c1d1b1.rmeta: /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/libp2p-plaintext-0.33.0/src/lib.rs /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/libp2p-plaintext-0.33.0/src/error.rs /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/libp2p-plaintext-0.33.0/src/handshake.rs /root/0g-storage-node/target/release/build/libp2p-plaintext-10daa7d378f67f3e/out/structs.rs
+
+/root/0g-storage-node/target/release/deps/liblibp2p_plaintext-044788a0f2c1d1b1.rlib: /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/libp2p-plaintext-0.33.0/src/lib.rs /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/libp2p-plaintext-0.33.0/src/error.rs /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/libp2p-plaintext-0.33.0/src/handshake.rs /root/0g-storage-node/target/release/build/libp2p-plaintext-10daa7d378f67f3e/out/structs.rs
+
+/root/0g-storage-node/target/release/deps/libp2p_plaintext-044788a0f2c1d1b1.d: /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/libp2p-plaintext-0.33.0/src/lib.rs /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/libp2p-plaintext-0.33.0/src/error.rs /root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/libp2p-plaintext-0.33.0/src/handshake.rs /root/0g-storage-node/target/release/build/libp2p-plaintext-10daa7d378f67f3e/out/structs.rs
+
+/root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/libp2p-plaintext-0.33.0/src/lib.rs:
+/root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/libp2p-plaintext-0.33.0/src/error.rs:
+/root/.cargo/registry/src/index.crates.io-6f17d22bba15001f/libp2p-plaintext-0.33.0/src/handshake.rs:
+/root/0g-storage-node/target/release/build/libp2p-plaintext-10daa7d378f67f3e/out/structs.rs:
+
+# env-dep:OUT_DIR=/root/0g-storage-node/target/release/build/libp2p-plaintext-10daa7d378f67f3e/out
