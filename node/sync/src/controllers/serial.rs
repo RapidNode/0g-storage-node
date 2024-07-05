@@ -13,6 +13,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use storage::log_store::log_manager::PORA_CHUNK_SIZE;
 use storage_async::Store;
 
 pub const MAX_CHUNKS_TO_REQUEST: u64 = 2 * 1024;
@@ -32,8 +33,8 @@ pub enum FailureReason {
 pub enum SyncState {
     Idle,
     FindingPeers {
+        origin: Instant,
         since: Instant,
-        updated: Instant,
     },
     FoundPeers,
     ConnectingPeers,
@@ -61,6 +62,8 @@ pub struct SerialSyncController {
 
     /// The unique transaction ID.
     tx_id: TxID,
+
+    tx_start_chunk_in_flow: u64,
 
     since: Instant,
 
@@ -92,6 +95,7 @@ pub struct SerialSyncController {
 impl SerialSyncController {
     pub fn new(
         tx_id: TxID,
+        tx_start_chunk_in_flow: u64,
         goal: FileSyncGoal,
         ctx: Arc<SyncNetworkContext>,
         store: Store,
@@ -100,12 +104,13 @@ impl SerialSyncController {
         SerialSyncController {
             tx_seq: tx_id.seq,
             tx_id,
+            tx_start_chunk_in_flow,
             since: Instant::now(),
             goal,
             next_chunk: goal.index_start,
             failures: 0,
             state: SyncState::Idle,
-            peers: Default::default(),
+            peers: SyncPeers::new(ctx.clone(), tx_id, file_location_cache.clone()),
             ctx,
             store,
             file_location_cache,
@@ -164,14 +169,10 @@ impl SerialSyncController {
             self.publish_find_chunks();
         }
 
-        let now = Instant::now();
-
-        let (since, updated) = match self.state {
-            SyncState::FindingPeers { since, .. } => (since, now),
-            _ => (now, now),
+        self.state = SyncState::FindingPeers {
+            origin: self.since,
+            since: Instant::now(),
         };
-
-        self.state = SyncState::FindingPeers { since, updated };
     }
 
     fn publish_find_file(&mut self) {
@@ -183,11 +184,16 @@ impl SerialSyncController {
             let peer_id: PeerId = announcement.peer_id.clone().into();
             let mut addr: Multiaddr = announcement.at.clone().into();
             addr.push(Protocol::P2p(peer_id.into()));
-
             found_new_peer = self.on_peer_found(peer_id, addr) || found_new_peer;
         }
 
-        if found_new_peer {
+        if found_new_peer
+            && self.peers.all_shards_available(vec![
+                PeerState::Found,
+                PeerState::Connecting,
+                PeerState::Connected,
+            ])
+        {
             return;
         }
 
@@ -208,30 +214,44 @@ impl SerialSyncController {
 
     fn try_connect(&mut self) {
         // select a random peer
-        let (peer_id, address) = match self.peers.random_peer(PeerState::Found) {
-            Some((peer_id, address)) => (peer_id, address),
-            None => {
-                // peer may be disconnected by remote node and need to find peers again
-                warn!(%self.tx_seq, "No peers available to connect");
-                self.state = SyncState::Idle;
-                return;
-            }
-        };
+        while !self
+            .peers
+            .all_shards_available(vec![PeerState::Connecting, PeerState::Connected])
+        {
+            let (peer_id, address) = match self.peers.random_peer(PeerState::Found) {
+                Some((peer_id, address)) => (peer_id, address),
+                None => {
+                    // peer may be disconnected by remote node and need to find peers again
+                    warn!(%self.tx_seq, "No peers available to connect");
+                    self.state = SyncState::Idle;
+                    return;
+                }
+            };
 
-        // connect to peer
-        info!(%peer_id, %address, "Attempting to connect to peer");
-        self.ctx.send(NetworkMessage::DialPeer { address, peer_id });
+            // connect to peer
+            info!(%peer_id, %address, "Attempting to connect to peer");
+            self.ctx.send(NetworkMessage::DialPeer { address, peer_id });
 
-        self.peers
-            .update_state(&peer_id, PeerState::Found, PeerState::Connecting);
-
+            self.peers
+                .update_state(&peer_id, PeerState::Found, PeerState::Connecting);
+        }
         self.state = SyncState::ConnectingPeers;
     }
 
     fn try_request_next(&mut self) {
+        // request next chunk array
+        let from_chunk = self.next_chunk;
+        let to_chunk = std::cmp::min(from_chunk + PORA_CHUNK_SIZE as u64, self.goal.index_end);
+        let request_id = network::RequestId::Sync(RequestId::SerialSync { tx_id: self.tx_id });
+        let request = GetChunksRequest {
+            tx_id: self.tx_id,
+            index_start: from_chunk,
+            index_end: to_chunk,
+        };
+
         // select a random peer
-        let peer_id = match self.peers.random_peer(PeerState::Connected) {
-            Some((peer_id, _)) => peer_id,
+        let peer_id = match self.select_peer_for_request(&request) {
+            Some(peer_id) => peer_id,
             None => {
                 warn!(%self.tx_seq, "No peers available to request chunks");
                 self.state = SyncState::Idle;
@@ -239,24 +259,11 @@ impl SerialSyncController {
             }
         };
 
-        // request next chunk array
-        let from_chunk = self.next_chunk;
-        let to_chunk = std::cmp::min(from_chunk + MAX_CHUNKS_TO_REQUEST, self.goal.index_end);
-
-        let request_id = network::RequestId::Sync(RequestId::SerialSync { tx_id: self.tx_id });
-
-        let request = network::Request::GetChunks(GetChunksRequest {
-            tx_id: self.tx_id,
-            index_start: from_chunk,
-            index_end: to_chunk,
-        });
-
         self.ctx.send(NetworkMessage::SendRequest {
             peer_id,
             request_id,
-            request,
+            request: network::Request::GetChunks(request),
         });
-
         self.state = SyncState::Downloading {
             peer_id,
             from_chunk,
@@ -273,12 +280,20 @@ impl SerialSyncController {
     }
 
     pub fn on_peer_found(&mut self, peer_id: PeerId, addr: Multiaddr) -> bool {
-        if self.peers.add_new_peer(peer_id, addr.clone()) {
-            info!(%self.tx_seq, %peer_id, %addr, "Found new peer");
-            true
+        if let Some(shard_config) = self.file_location_cache.get_peer_config(&peer_id) {
+            if self
+                .peers
+                .add_new_peer_with_config(peer_id, addr.clone(), shard_config)
+            {
+                info!(%self.tx_seq, %peer_id, %addr, "Found new peer");
+                true
+            } else {
+                // e.g. multiple `AnnounceFile` messages propagated
+                debug!(%self.tx_seq, %peer_id, %addr, "Found an existing peer");
+                false
+            }
         } else {
-            // e.g. multiple `AnnounceFile` messages propagated
-            debug!(%self.tx_seq, %peer_id, %addr, "Found an existing peer");
+            debug!(%self.tx_seq, %peer_id, %addr, "No shard config found");
             false
         }
     }
@@ -405,8 +420,6 @@ impl SerialSyncController {
         let validation_result = self
             .store
             .get_store()
-            .write()
-            .await
             .validate_and_insert_range_proof(self.tx_seq, &response);
 
         match validation_result {
@@ -428,13 +441,18 @@ impl SerialSyncController {
 
         self.failures = 0;
 
+        let shard_config = self.store.get_store().flow().get_shard_config();
+        let next_chunk = shard_config.next_segment_index(
+            (from_chunk / PORA_CHUNK_SIZE as u64) as usize,
+            (self.tx_start_chunk_in_flow / PORA_CHUNK_SIZE as u64) as usize,
+        ) * PORA_CHUNK_SIZE;
         // store in db
         match self
             .store
             .put_chunks_with_tx_hash(self.tx_id.seq, self.tx_id.hash, response.chunks, None)
             .await
         {
-            Ok(true) => self.next_chunk = to_chunk,
+            Ok(true) => self.next_chunk = next_chunk as u64,
             Ok(false) => {
                 warn!(?self.tx_id, "Transaction reverted while storing chunks");
                 self.state = SyncState::Failed {
@@ -515,40 +533,65 @@ impl SerialSyncController {
         }
     }
 
+    fn select_peer_for_request(&self, request: &GetChunksRequest) -> Option<PeerId> {
+        let segment_index =
+            (request.index_start + self.tx_start_chunk_in_flow) / PORA_CHUNK_SIZE as u64;
+        let peers = self.peers.filter_peers(vec![PeerState::Connected]);
+        // TODO: Add randomness
+        for peer in peers {
+            if let Some(shard_config) = self.peers.shard_config(&peer) {
+                if shard_config.in_range(segment_index) {
+                    return Some(peer);
+                }
+            }
+        }
+        None
+    }
+
     pub fn transition(&mut self) {
         use PeerState::*;
+
+        debug!(%self.tx_seq, ?self.state, "transition started");
 
         // update peer connection states
         self.peers.transition();
 
-        loop {
+        let mut completed = false;
+
+        while !completed {
             match self.state {
                 SyncState::Idle => {
-                    if self.peers.count(&[Found, Connecting, Connected]) > 0 {
+                    if self
+                        .peers
+                        .all_shards_available(vec![Found, Connecting, Connected])
+                    {
                         self.state = SyncState::FoundPeers;
                     } else {
                         self.try_find_peers();
                     }
                 }
 
-                SyncState::FindingPeers { updated, .. } => {
-                    if self.peers.count(&[Found, Connecting, Connected]) > 0 {
+                SyncState::FindingPeers { since, .. } => {
+                    if self
+                        .peers
+                        .all_shards_available(vec![Found, Connecting, Connected])
+                    {
                         self.state = SyncState::FoundPeers;
                     } else {
                         // storage node may not have the specific file when `FindFile`
                         // gossip message received. In this case, just broadcast the
                         // `FindFile` message again.
-                        if updated.elapsed() >= PEER_REQUEST_TIMEOUT {
-                            debug!(%self.tx_seq, "Peer request timeout");
+                        if since.elapsed() >= PEER_REQUEST_TIMEOUT {
+                            debug!(%self.tx_seq, "Finding peer timeout and try to find peers again");
                             self.try_find_peers();
                         }
 
-                        return;
+                        completed = true;
                     }
                 }
 
                 SyncState::FoundPeers => {
-                    if self.peers.count(&[Connecting, Connected]) > 0 {
+                    if self.peers.all_shards_available(vec![Connecting, Connected]) {
                         self.state = SyncState::ConnectingPeers;
                     } else {
                         self.try_connect();
@@ -556,48 +599,53 @@ impl SerialSyncController {
                 }
 
                 SyncState::ConnectingPeers => {
-                    if self.peers.count(&[Connected]) > 0 {
+                    if self.peers.all_shards_available(vec![Connected]) {
                         self.state = SyncState::AwaitingDownload {
                             since: Instant::now(),
                         };
                     } else if self.peers.count(&[Connecting]) == 0 {
+                        debug!(%self.tx_seq, "Connecting to peers timeout and try to find other peers to dial");
                         self.state = SyncState::Idle;
                     } else {
                         // peers.transition() will handle the case that peer connecting timeout
-                        return;
+                        completed = true;
                     }
                 }
 
                 SyncState::AwaitingOutgoingConnection { since } => {
                     if since.elapsed() < WAIT_OUTGOING_CONNECTION_TIMEOUT {
-                        return;
+                        completed = true;
+                    } else {
+                        debug!(%self.tx_seq, "Waiting for outgoing connection timeout and try to find other peers to dial");
+                        self.state = SyncState::Idle;
                     }
-
-                    self.state = SyncState::Idle;
                 }
 
                 SyncState::AwaitingDownload { since } => {
                     if Instant::now() < since {
-                        return;
+                        completed = true;
+                    } else {
+                        self.try_request_next();
                     }
-
-                    self.try_request_next();
                 }
 
                 SyncState::Downloading { peer_id, since, .. } => {
                     if !matches!(self.peers.peer_state(&peer_id), Some(PeerState::Connected)) {
                         // e.g. peer disconnected by remote node
+                        debug!(%self.tx_seq, "No peer to continue downloading and try to find other peers to download");
                         self.state = SyncState::Idle;
                     } else if since.elapsed() >= DOWNLOAD_TIMEOUT {
                         self.handle_response_failure(peer_id, "RPC timeout");
                     } else {
-                        return;
+                        completed = true;
                     }
                 }
 
-                SyncState::Completed | SyncState::Failed { .. } => return,
+                SyncState::Completed | SyncState::Failed { .. } => completed = true,
             }
         }
+
+        debug!(%self.tx_seq, ?self.state, "transition ended");
     }
 }
 
@@ -614,7 +662,6 @@ mod tests {
     use storage::H256;
     use task_executor::{test_utils::TestRuntime, TaskExecutor};
     use tokio::sync::mpsc::{self, UnboundedReceiver};
-    use tokio::sync::RwLock;
 
     #[test]
     fn test_status() {
@@ -1062,8 +1109,6 @@ mod tests {
         );
 
         let chunks = peer_store
-            .read()
-            .await
             .get_chunks_with_proof_by_tx_and_index_range(tx_seq, 0, chunk_count)
             .unwrap()
             .unwrap();
@@ -1096,8 +1141,6 @@ mod tests {
         );
 
         let mut chunks = peer_store
-            .read()
-            .await
             .get_chunks_with_proof_by_tx_and_index_range(tx_seq, 0, chunk_count)
             .unwrap()
             .unwrap();
@@ -1165,8 +1208,6 @@ mod tests {
         );
 
         let chunks = peer_store
-            .read()
-            .await
             .get_chunks_with_proof_by_tx_and_index_range(tx_seq, 0, chunk_count)
             .unwrap()
             .unwrap();
@@ -1188,7 +1229,6 @@ mod tests {
                     source,
                     msg,
                 } => {
-                    assert_eq!(peer_id, peer_id);
                     match action {
                         PeerAction::Fatal => {}
                         _ => {
@@ -1231,8 +1271,6 @@ mod tests {
         );
 
         let chunks = peer_store
-            .read()
-            .await
             .get_chunks_with_proof_by_tx_and_index_range(tx_seq, 0, chunk_count)
             .unwrap()
             .unwrap();
@@ -1305,8 +1343,6 @@ mod tests {
         );
 
         let chunks = peer_store
-            .read()
-            .await
             .get_chunks_with_proof_by_tx_and_index_range(tx_seq, 0, chunk_count)
             .unwrap()
             .unwrap();
@@ -1336,7 +1372,7 @@ mod tests {
         let peer_id = identity::Keypair::generate_ed25519().public().to_peer_id();
 
         let tx_seq = 0;
-        let chunk_count = 2049;
+        let chunk_count = 1025;
         let (store, peer_store, txs, _) = create_2_store(vec![chunk_count]);
 
         let runtime = TestRuntime::default();
@@ -1350,29 +1386,27 @@ mod tests {
         );
 
         let chunks = peer_store
-            .read()
-            .await
-            .get_chunks_with_proof_by_tx_and_index_range(tx_seq, 0, 2048)
+            .get_chunks_with_proof_by_tx_and_index_range(tx_seq, 0, 1024)
             .unwrap()
             .unwrap();
 
         controller.state = SyncState::Downloading {
             peer_id,
             from_chunk: 0,
-            to_chunk: 2048,
+            to_chunk: 1024,
             since: Instant::now(),
         };
 
-        controller.goal.num_chunks = 2048;
-        controller.goal.index_end = 2048;
+        controller.goal.num_chunks = 1024;
+        controller.goal.index_end = 1024;
 
         controller.on_response(peer_id, chunks).await;
         match controller.get_status() {
             SyncState::Failed { reason } => {
                 assert!(matches!(reason, FailureReason::DBError(..)));
             }
-            _ => {
-                panic!("Not expected SyncState");
+            state => {
+                panic!("Not expected SyncState, {:?}", state);
             }
         }
 
@@ -1398,8 +1432,6 @@ mod tests {
         );
 
         let chunks = peer_store
-            .read()
-            .await
             .get_chunks_with_proof_by_tx_and_index_range(tx_seq, 0, chunk_count)
             .unwrap()
             .unwrap();
@@ -1522,7 +1554,7 @@ mod tests {
         let num_chunks = 123;
 
         let config = LogConfig::default();
-        let store = Arc::new(RwLock::new(LogManager::memorydb(config).unwrap()));
+        let store = Arc::new(LogManager::memorydb(config).unwrap());
 
         create_controller(task_executor, peer_id, store, tx_id, num_chunks)
     }
@@ -1530,7 +1562,7 @@ mod tests {
     fn create_controller(
         task_executor: TaskExecutor,
         peer_id: Option<PeerId>,
-        store: Arc<RwLock<LogManager>>,
+        store: Arc<LogManager>,
         tx_id: TxID,
         num_chunks: usize,
     ) -> (SerialSyncController, UnboundedReceiver<NetworkMessage>) {
@@ -1546,6 +1578,7 @@ mod tests {
 
         let controller = SerialSyncController::new(
             tx_id,
+            0,
             FileSyncGoal::new_file(num_chunks as u64),
             ctx,
             Store::new(store, task_executor),

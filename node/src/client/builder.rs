@@ -1,5 +1,5 @@
 use super::{Client, RuntimeContext};
-use chunk_pool::{Config as ChunkPoolConfig, MemoryChunkPool};
+use chunk_pool::{ChunkPoolMessage, Config as ChunkPoolConfig, MemoryChunkPool};
 use file_location_cache::FileLocationCache;
 use log_entry_sync::{LogSyncConfig, LogSyncEvent, LogSyncManager};
 use miner::{MineService, MinerConfig, MinerMessage};
@@ -7,6 +7,7 @@ use network::{
     self, Keypair, NetworkConfig, NetworkGlobals, NetworkMessage, RequestId,
     Service as LibP2PService,
 };
+use pruner::{Pruner, PrunerConfig, PrunerMessage};
 use router::RouterService;
 use rpc::RPCConfig;
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use storage::log_store::log_manager::LogConfig;
 use storage::log_store::Store;
 use storage::{LogManager, StorageConfig};
 use sync::{SyncSender, SyncService};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc};
 
 macro_rules! require {
     ($component:expr, $self:ident, $e:ident) => {
@@ -49,6 +50,15 @@ struct LogSyncComponents {
     send: broadcast::Sender<LogSyncEvent>,
 }
 
+struct PrunerComponents {
+    // note: these will be owned by the router service
+    owned: Option<mpsc::UnboundedReceiver<PrunerMessage>>,
+}
+
+struct ChunkPoolComponents {
+    send: mpsc::UnboundedSender<ChunkPoolMessage>,
+}
+
 /// Builds a `Client` instance.
 ///
 /// ## Notes
@@ -58,13 +68,15 @@ struct LogSyncComponents {
 #[derive(Default)]
 pub struct ClientBuilder {
     runtime_context: Option<RuntimeContext>,
-    store: Option<Arc<RwLock<dyn Store>>>,
-    async_store: Option<storage_async::Store>,
+    store: Option<Arc<dyn Store>>,
+    async_store: Option<Arc<storage_async::Store>>,
     file_location_cache: Option<Arc<FileLocationCache>>,
     network: Option<NetworkComponents>,
     sync: Option<SyncComponents>,
     miner: Option<MinerComponents>,
     log_sync: Option<LogSyncComponents>,
+    pruner: Option<PrunerComponents>,
+    chunk_pool: Option<ChunkPoolComponents>,
 }
 
 impl ClientBuilder {
@@ -77,15 +89,18 @@ impl ClientBuilder {
     /// Initializes in-memory storage.
     pub fn with_memory_store(mut self) -> Result<Self, String> {
         // TODO(zz): Set config.
-        let store = Arc::new(RwLock::new(
+        let store = Arc::new(
             LogManager::memorydb(LogConfig::default())
                 .map_err(|e| format!("Unable to start in-memory store: {:?}", e))?,
-        ));
+        );
 
         self.store = Some(store.clone());
 
         if let Some(ctx) = self.runtime_context.as_ref() {
-            self.async_store = Some(storage_async::Store::new(store, ctx.executor.clone()));
+            self.async_store = Some(Arc::new(storage_async::Store::new(
+                store,
+                ctx.executor.clone(),
+            )));
         }
 
         Ok(self)
@@ -93,15 +108,18 @@ impl ClientBuilder {
 
     /// Initializes RocksDB storage.
     pub fn with_rocksdb_store(mut self, config: &StorageConfig) -> Result<Self, String> {
-        let store = Arc::new(RwLock::new(
+        let store = Arc::new(
             LogManager::rocksdb(LogConfig::default(), &config.db_dir)
                 .map_err(|e| format!("Unable to start RocksDB store: {:?}", e))?,
-        ));
+        );
 
         self.store = Some(store.clone());
 
         if let Some(ctx) = self.runtime_context.as_ref() {
-            self.async_store = Some(storage_async::Store::new(store, ctx.executor.clone()));
+            self.async_store = Some(Arc::new(storage_async::Store::new(
+                store,
+                ctx.executor.clone(),
+            )));
         }
 
         Ok(self)
@@ -165,7 +183,7 @@ impl ClientBuilder {
         if let Some(config) = config {
             let executor = require!("miner", self, runtime_context).clone().executor;
             let network_send = require!("miner", self, network).send.clone();
-            let store = self.store.as_ref().unwrap().clone();
+            let store = self.async_store.as_ref().unwrap().clone();
 
             let send = MineService::spawn(executor, network_send, config, store).await?;
             self.miner = Some(MinerComponents { send });
@@ -174,11 +192,25 @@ impl ClientBuilder {
         Ok(self)
     }
 
+    pub async fn with_pruner(mut self, config: Option<PrunerConfig>) -> Result<Self, String> {
+        if let Some(config) = config {
+            let miner_send = self.miner.as_ref().map(|miner| miner.send.clone());
+            let store = require!("pruner", self, async_store).clone();
+            let executor = require!("pruner", self, runtime_context).clone().executor;
+            let recv = Pruner::spawn(executor, config, store, miner_send)
+                .await
+                .map_err(|e| e.to_string())?;
+            self.pruner = Some(PrunerComponents { owned: Some(recv) });
+        }
+        Ok(self)
+    }
+
     /// Starts the networking stack.
     pub fn with_router(mut self, router_config: router::Config) -> Result<Self, String> {
         let executor = require!("router", self, runtime_context).clone().executor;
         let sync_send = require!("router", self, sync).send.clone(); // note: we can make this optional in the future
         let miner_send = self.miner.as_ref().map(|x| x.send.clone());
+        let chunk_pool_send = require!("router", self, chunk_pool).send.clone();
         let store = require!("router", self, store).clone();
         let file_location_cache = require!("router", self, file_location_cache).clone();
 
@@ -188,7 +220,7 @@ impl ClientBuilder {
             .owned
             .take() // router takes ownership of libp2p and network_recv
             .ok_or("router requires a network")?;
-
+        let pruner_recv = self.pruner.as_mut().and_then(|pruner| pruner.owned.take());
         RouterService::spawn(
             executor,
             libp2p,
@@ -197,6 +229,8 @@ impl ClientBuilder {
             network.send.clone(),
             sync_send,
             miner_send,
+            chunk_pool_send,
+            pruner_recv,
             store,
             file_location_cache,
             network.keypair.clone(),
@@ -207,7 +241,7 @@ impl ClientBuilder {
     }
 
     pub async fn with_rpc(
-        self,
+        mut self,
         rpc_config: RPCConfig,
         chunk_pool_config: ChunkPoolConfig,
     ) -> Result<Self, String> {
@@ -223,6 +257,9 @@ impl ClientBuilder {
 
         let (chunk_pool, chunk_pool_handler) =
             chunk_pool::unbounded(chunk_pool_config, async_store.clone(), network_send.clone());
+        let chunk_pool_components = ChunkPoolComponents {
+            send: chunk_pool.sender(),
+        };
 
         let chunk_pool_clone = chunk_pool.clone();
         let ctx = rpc::Context {
@@ -249,6 +286,8 @@ impl ClientBuilder {
             MemoryChunkPool::monitor_log_entry(chunk_pool_clone, synced_tx_recv),
             "chunk_pool_log_monitor",
         );
+
+        self.chunk_pool = Some(chunk_pool_components);
 
         Ok(self)
     }

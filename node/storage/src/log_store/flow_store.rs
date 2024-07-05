@@ -1,14 +1,16 @@
 use super::load_chunk::EntryBatch;
 use super::{MineLoadChunk, SealAnswer, SealTask};
+use crate::config::ShardConfig;
 use crate::error::Error;
 use crate::log_store::log_manager::{
-    bytes_to_entries, COL_ENTRY_BATCH, COL_ENTRY_BATCH_ROOT, COL_FLOW_MPT_NODES,
+    bytes_to_entries, COL_ENTRY_BATCH, COL_ENTRY_BATCH_ROOT, COL_FLOW_MPT_NODES, PORA_CHUNK_SIZE,
 };
 use crate::log_store::{FlowRead, FlowSeal, FlowWrite};
 use crate::{try_option, ZgsKeyValueDB};
 use anyhow::{anyhow, bail, Result};
 use append_merkle::{MerkleTreeInitialData, MerkleTreeRead};
 use itertools::Itertools;
+use parking_lot::RwLock;
 use shared_types::{ChunkArray, DataRoot, FlowProof};
 use ssz::{Decode, Encode};
 use ssz_derive::{Decode as DeriveDecode, Encode as DeriveEncode};
@@ -23,10 +25,10 @@ use zgs_spec::{BYTES_PER_SECTOR, SEALS_PER_LOAD, SECTORS_PER_LOAD, SECTORS_PER_S
 pub struct FlowStore {
     db: FlowDBStore,
     // TODO(kevin): This is an in-memory cache for recording which chunks are ready for sealing. It should be persisted on disk.
-    to_seal_set: BTreeMap<usize, usize>,
+    to_seal_set: RwLock<BTreeMap<usize, usize>>,
     // Data sealing is an asynchronized process.
     // The sealing service uses the version number to distinguish if revert happens during sealing.
-    to_seal_version: usize,
+    to_seal_version: RwLock<usize>,
     config: FlowConfig,
 }
 
@@ -35,7 +37,7 @@ impl FlowStore {
         Self {
             db: FlowDBStore::new(db),
             to_seal_set: Default::default(),
-            to_seal_version: 0,
+            to_seal_version: RwLock::new(0),
             config,
         }
     }
@@ -76,17 +78,31 @@ impl FlowStore {
     pub fn put_mpt_node_list(&self, node_list: Vec<(usize, usize, DataRoot)>) -> Result<()> {
         self.db.put_mpt_node_list(node_list)
     }
+
+    pub fn delete_batch_list(&self, batch_list: &[u64]) -> Result<()> {
+        let mut to_seal_set = self.to_seal_set.write();
+        for batch_index in batch_list {
+            for seal_index in (*batch_index as usize) * SEALS_PER_LOAD
+                ..(*batch_index as usize + 1) * SEALS_PER_LOAD
+            {
+                to_seal_set.remove(&seal_index);
+            }
+        }
+        self.db.delete_batch_list(batch_list)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct FlowConfig {
     pub batch_size: usize,
+    pub shard_config: Arc<RwLock<ShardConfig>>,
 }
 
 impl Default for FlowConfig {
     fn default() -> Self {
         Self {
             batch_size: SECTORS_PER_LOAD,
+            shard_config: Default::default(),
         }
     }
 }
@@ -189,12 +205,26 @@ impl FlowRead for FlowStore {
         }
         Ok(Some(mine_chunk))
     }
+
+    fn get_num_entries(&self) -> Result<u64> {
+        // This is an over-estimation as it assumes each batch is full.
+        self.db
+            .kvdb
+            .num_keys(COL_ENTRY_BATCH)
+            .map(|num_batches| num_batches * PORA_CHUNK_SIZE as u64)
+            .map_err(Into::into)
+    }
+
+    fn get_shard_config(&self) -> ShardConfig {
+        *self.config.shard_config.read()
+    }
 }
 
 impl FlowWrite for FlowStore {
     /// Return the roots of completed chunks. The order is guaranteed to be increasing
     /// by chunk index.
-    fn append_entries(&mut self, data: ChunkArray) -> Result<Vec<(u64, DataRoot)>> {
+    fn append_entries(&self, data: ChunkArray) -> Result<Vec<(u64, DataRoot)>> {
+        let mut to_seal_set = self.to_seal_set.write();
         trace!("append_entries: {} {}", data.start_index, data.data.len());
         if data.data.len() % BYTES_PER_SECTOR != 0 {
             bail!("append_entries: invalid data size, len={}", data.data.len());
@@ -211,6 +241,10 @@ impl FlowWrite for FlowStore {
                 .expect("in range");
 
             let chunk_index = chunk.start_index / self.config.batch_size as u64;
+            if !self.config.shard_config.read().in_range(chunk_index) {
+                // The data are in a shard range that we are not storing.
+                continue;
+            }
 
             // TODO: Try to avoid loading from db if possible.
             let mut batch = self
@@ -222,9 +256,9 @@ impl FlowWrite for FlowStore {
                 chunk.data,
             )?;
             completed_seals.into_iter().for_each(|x| {
-                self.to_seal_set.insert(
+                to_seal_set.insert(
                     chunk_index as usize * SEALS_PER_LOAD + x as usize,
-                    self.to_seal_version,
+                    *self.to_seal_version.read(),
                 );
             });
 
@@ -233,23 +267,29 @@ impl FlowWrite for FlowStore {
         self.db.put_entry_batch_list(batch_list)
     }
 
-    fn truncate(&mut self, start_index: u64) -> crate::error::Result<()> {
+    fn truncate(&self, start_index: u64) -> crate::error::Result<()> {
+        let mut to_seal_set = self.to_seal_set.write();
+        let mut to_seal_version = self.to_seal_version.write();
         let to_reseal = self.db.truncate(start_index, self.config.batch_size)?;
 
-        self.to_seal_set
-            .split_off(&(start_index as usize / SECTORS_PER_SEAL));
-        self.to_seal_version += 1;
+        to_seal_set.split_off(&(start_index as usize / SECTORS_PER_SEAL));
+        *to_seal_version += 1;
 
         to_reseal.into_iter().for_each(|x| {
-            self.to_seal_set.insert(x, self.to_seal_version);
+            to_seal_set.insert(x, *to_seal_version);
         });
         Ok(())
+    }
+
+    fn update_shard_config(&self, shard_config: ShardConfig) {
+        *self.config.shard_config.write() = shard_config;
     }
 }
 
 impl FlowSeal for FlowStore {
     fn pull_seal_chunk(&self, seal_index_max: usize) -> Result<Option<Vec<SealTask>>> {
-        let mut to_seal_iter = self.to_seal_set.iter();
+        let to_seal_set = self.to_seal_set.read();
+        let mut to_seal_iter = to_seal_set.iter();
         let (&first_index, &first_version) = try_option!(to_seal_iter.next());
         if first_index >= seal_index_max {
             return Ok(None);
@@ -281,9 +321,10 @@ impl FlowSeal for FlowStore {
         Ok(Some(tasks))
     }
 
-    fn submit_seal_result(&mut self, answers: Vec<SealAnswer>) -> Result<()> {
+    fn submit_seal_result(&self, answers: Vec<SealAnswer>) -> Result<()> {
+        let mut to_seal_set = self.to_seal_set.write();
         let is_consistent = |answer: &SealAnswer| {
-            self.to_seal_set
+            to_seal_set
                 .get(&(answer.seal_index as usize))
                 .map_or(false, |cur_ver| cur_ver == &answer.version)
         };
@@ -293,7 +334,7 @@ impl FlowSeal for FlowStore {
         for (load_index, answers_in_chunk) in &answers
             .into_iter()
             .filter(is_consistent)
-            .group_by(|answer| answer.seal_index / SEALS_PER_LOAD as u64)
+            .chunk_by(|answer| answer.seal_index / SEALS_PER_LOAD as u64)
         {
             let mut batch_chunk = self
                 .db
@@ -309,7 +350,7 @@ impl FlowSeal for FlowStore {
         debug!("Seal chunks: indices = {:?}", removed_seal_index);
 
         for idx in removed_seal_index.into_iter() {
-            self.to_seal_set.remove(&idx);
+            to_seal_set.remove(&idx);
         }
 
         self.db.put_entry_raw(updated_chunk)?;
@@ -526,6 +567,14 @@ impl FlowDBStore {
         }
         Ok(node_list)
     }
+
+    fn delete_batch_list(&self, batch_list: &[u64]) -> Result<()> {
+        let mut tx = self.kvdb.transaction();
+        for i in batch_list {
+            tx.delete(COL_ENTRY_BATCH, &i.to_be_bytes());
+        }
+        Ok(self.kvdb.write(tx)?)
+    }
 }
 
 #[derive(DeriveEncode, DeriveDecode, Clone, Debug)]
@@ -544,6 +593,21 @@ pub fn batch_iter(start: u64, end: u64, batch_size: usize) -> Vec<(u64, u64)> {
         list.push((batch_start, batch_end));
     }
     list
+}
+
+pub fn batch_iter_sharded(
+    start: u64,
+    end: u64,
+    batch_size: usize,
+    shard_config: ShardConfig,
+) -> Vec<(u64, u64)> {
+    batch_iter(start, end, batch_size)
+        .into_iter()
+        .filter(|(start, _)| {
+            (start / batch_size as u64) % shard_config.num_shard as u64
+                == shard_config.shard_id as u64
+        })
+        .collect()
 }
 
 fn try_decode_usize(data: &[u8]) -> Result<usize> {

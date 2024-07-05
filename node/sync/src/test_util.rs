@@ -8,7 +8,6 @@ use storage::{
     },
     LogManager,
 };
-use tokio::sync::RwLock;
 
 /// Creates stores for local node and peers with initialized transaction of specified chunk count.
 /// The first store is for local node, and data not stored. The second store is for peers, and all
@@ -17,8 +16,8 @@ use tokio::sync::RwLock;
 pub fn create_2_store(
     chunk_count: Vec<usize>,
 ) -> (
-    Arc<RwLock<LogManager>>,
-    Arc<RwLock<LogManager>>,
+    Arc<LogManager>,
+    Arc<LogManager>,
     Vec<Transaction>,
     Vec<Vec<u8>>,
 ) {
@@ -37,12 +36,7 @@ pub fn create_2_store(
         offset = ret.2;
     }
 
-    (
-        Arc::new(RwLock::new(store)),
-        Arc::new(RwLock::new(peer_store)),
-        txs,
-        data,
-    )
+    (Arc::new(store), Arc::new(peer_store), txs, data)
 }
 
 fn generate_data(
@@ -99,13 +93,13 @@ pub mod tests {
     use libp2p::PeerId;
     use shared_types::TxID;
     use std::sync::Arc;
+    use storage::config::ShardConfig;
     use storage::{
         log_store::{log_manager::LogConfig, Store as LogStore},
         LogManager,
     };
     use storage_async::Store;
     use task_executor::test_utils::TestRuntime;
-    use tokio::sync::RwLock;
 
     pub struct TestStoreRuntime {
         pub runtime: TestRuntime,
@@ -114,7 +108,7 @@ pub mod tests {
 
     impl Default for TestStoreRuntime {
         fn default() -> Self {
-            let store = Arc::new(RwLock::new(Self::new_store()));
+            let store = Arc::new(Self::new_store());
             Self::new(store)
         }
     }
@@ -124,7 +118,7 @@ pub mod tests {
             LogManager::memorydb(LogConfig::default()).unwrap()
         }
 
-        pub fn new(store: Arc<RwLock<dyn LogStore>>) -> TestStoreRuntime {
+        pub fn new(store: Arc<dyn LogStore>) -> TestStoreRuntime {
             let runtime = TestRuntime::default();
             let executor = runtime.task_executor.clone();
             Self {
@@ -144,6 +138,7 @@ pub mod tests {
                 .build();
             cache.insert(announcement);
         }
+        cache.insert_peer_config(peer_id, ShardConfig::default());
 
         Arc::new(cache)
     }

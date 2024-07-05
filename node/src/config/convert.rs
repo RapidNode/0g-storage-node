@@ -3,9 +3,12 @@
 use crate::ZgsConfig;
 use ethereum_types::{H256, U256};
 use log_entry_sync::{CacheConfig, ContractAddress, LogSyncConfig};
-use miner::{MinerConfig, ShardConfig};
+use miner::MinerConfig;
 use network::NetworkConfig;
+use pruner::PrunerConfig;
 use rpc::RPCConfig;
+use std::time::Duration;
+use storage::config::ShardConfig;
 use storage::StorageConfig;
 
 impl ZgsConfig {
@@ -21,12 +24,12 @@ impl ZgsConfig {
         network_config.libp2p_port = self.network_libp2p_port;
         network_config.disable_discovery = self.network_disable_discovery;
         network_config.discovery_port = self.network_discovery_port;
-        network_config.enr_tcp_port = self.network_enr_tcp_port;
-        network_config.enr_udp_port = self.network_enr_udp_port;
-        network_config.enr_address = self
-            .network_enr_address
-            .as_ref()
-            .map(|x| x.parse::<std::net::IpAddr>().unwrap());
+
+        if let Some(addr) = &self.network_enr_address {
+            network_config.enr_tcp_port = Some(self.network_enr_tcp_port);
+            network_config.enr_udp_port = Some(self.network_enr_udp_port);
+            network_config.enr_address = Some(addr.parse().unwrap());
+        }
 
         network_config.boot_nodes_multiaddr = self
             .network_boot_nodes
@@ -43,8 +46,16 @@ impl ZgsConfig {
             .map_err(|e| format!("Unable to parse network_libp2p_nodes: {:?}", e))?;
 
         network_config.discv5_config.table_filter = |_| true;
+        network_config.discv5_config.request_timeout =
+            Duration::from_secs(self.discv5_request_timeout_secs);
+        network_config.discv5_config.query_peer_timeout =
+            Duration::from_secs(self.discv5_query_peer_timeout_secs);
+        network_config.discv5_config.request_retries = self.discv5_request_retries;
+        network_config.discv5_config.query_parallelism = self.discv5_query_parallelism;
+        network_config.discv5_config.report_discovered_peers = self.discv5_report_discovered_peers;
+        network_config.discv5_config.enable_packet_filter = !self.discv5_disable_packet_filter;
+        network_config.discv5_config.ip_limit = !self.discv5_disable_ip_limit;
 
-        // TODO
         network_config.target_peers = self.network_target_peers;
         network_config.private = self.network_private;
 
@@ -143,7 +154,7 @@ impl ZgsConfig {
         let cpu_percentage = self.miner_cpu_percentage;
         let iter_batch = self.mine_iter_batch_size;
 
-        let shard_config = ShardConfig::new(self.shard_group_bytes, &self.shard_position)?;
+        let shard_config = self.shard_config()?;
 
         Ok(MinerConfig::new(
             miner_id,
@@ -158,18 +169,39 @@ impl ZgsConfig {
         ))
     }
 
-    pub fn chunk_pool_config(&self) -> chunk_pool::Config {
-        chunk_pool::Config {
+    pub fn chunk_pool_config(&self) -> Result<chunk_pool::Config, String> {
+        Ok(chunk_pool::Config {
             write_window_size: self.chunk_pool_write_window_size,
             max_cached_chunks_all: self.chunk_pool_max_cached_chunks_all,
             max_writings: self.chunk_pool_max_writings,
             expiration_time_secs: self.chunk_pool_expiration_time_secs,
-        }
+            shard_config: self.shard_config()?,
+        })
     }
 
     pub fn router_config(&self, network_config: &NetworkConfig) -> Result<router::Config, String> {
         let mut router_config = router::Config::default();
         router_config.libp2p_nodes = network_config.libp2p_nodes.to_vec();
         Ok(router_config)
+    }
+
+    pub fn pruner_config(&self) -> Result<Option<PrunerConfig>, String> {
+        if let Some(max_num_chunks) = self.db_max_num_chunks {
+            let shard_config = self.shard_config()?;
+            Ok(Some(PrunerConfig {
+                shard_config,
+                db_path: self.db_dir.clone().into(),
+                max_num_chunks,
+                check_time: Duration::from_secs(self.prune_check_time_s),
+                batch_size: self.prune_batch_size,
+                batch_wait_time: Duration::from_millis(self.prune_batch_wait_time_ms),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn shard_config(&self) -> Result<ShardConfig, String> {
+        ShardConfig::new(&self.shard_position)
     }
 }

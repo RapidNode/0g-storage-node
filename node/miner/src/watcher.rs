@@ -72,7 +72,7 @@ impl MineContextWatcher {
         let mut mining_enabled = true;
         let mut channel_opened = true;
 
-        let mut mining_throttle = sleep(Duration::from_secs(15));
+        let mut mining_throttle = sleep(Duration::from_secs(0));
         tokio::pin!(mining_throttle);
 
         loop {

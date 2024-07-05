@@ -3,24 +3,24 @@ use crate::mem_pool::FileID;
 use anyhow::Result;
 use network::NetworkMessage;
 use shared_types::{ChunkArray, FileProof};
-use std::sync::Arc;
-use storage_async::Store;
+use std::{sync::Arc, time::SystemTime};
+use storage_async::{ShardConfig, Store};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// Handle the cached file when uploaded completely and verified from blockchain.
 /// Generally, the file will be persisted into log store.
 pub struct ChunkPoolHandler {
-    receiver: UnboundedReceiver<FileID>,
+    receiver: UnboundedReceiver<ChunkPoolMessage>,
     mem_pool: Arc<MemoryChunkPool>,
-    log_store: Store,
+    log_store: Arc<Store>,
     sender: UnboundedSender<NetworkMessage>,
 }
 
 impl ChunkPoolHandler {
     pub(crate) fn new(
-        receiver: UnboundedReceiver<FileID>,
+        receiver: UnboundedReceiver<ChunkPoolMessage>,
         mem_pool: Arc<MemoryChunkPool>,
-        log_store: Store,
+        log_store: Arc<Store>,
         sender: UnboundedSender<NetworkMessage>,
     ) -> Self {
         ChunkPoolHandler {
@@ -31,14 +31,20 @@ impl ChunkPoolHandler {
         }
     }
 
+    async fn handle(&mut self) -> Result<bool> {
+        match self.receiver.recv().await {
+            Some(ChunkPoolMessage::FinalizeFile(file_id)) => self.handle_file_id(file_id).await,
+            Some(ChunkPoolMessage::ChangeShardConfig(shard_config)) => {
+                self.handle_change_shard_config(shard_config).await;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Writes memory cached chunks into store and finalize transaction.
     /// Note, a separate thread should be spawned to call this method.
-    pub async fn handle(&mut self) -> Result<bool> {
-        let id = match self.receiver.recv().await {
-            Some(id) => id,
-            None => return Ok(false),
-        };
-
+    async fn handle_file_id(&mut self, id: FileID) -> Result<bool> {
         debug!(?id, "Received task to finalize transaction");
 
         // TODO(qhz): remove from memory pool after transaction finalized,
@@ -62,6 +68,7 @@ impl ChunkPoolHandler {
             }
         }
 
+        let start = SystemTime::now();
         if !self
             .log_store
             .finalize_tx_with_hash(id.tx_id.seq, id.tx_id.hash)
@@ -70,7 +77,8 @@ impl ChunkPoolHandler {
             return Ok(false);
         }
 
-        debug!(?id, "Transaction finalized");
+        let elapsed = start.elapsed()?;
+        debug!(?id, ?elapsed, "Transaction finalized");
 
         // always remove file from pool after transaction finalized
         self.mem_pool.remove_file(&id.root).await;
@@ -86,6 +94,10 @@ impl ChunkPoolHandler {
         Ok(true)
     }
 
+    async fn handle_change_shard_config(&self, shard_config: ShardConfig) {
+        self.mem_pool.set_shard_config(shard_config).await
+    }
+
     pub async fn run(mut self) {
         info!("Worker started to finalize transactions");
 
@@ -95,4 +107,9 @@ impl ChunkPoolHandler {
             }
         }
     }
+}
+
+pub enum ChunkPoolMessage {
+    FinalizeFile(FileID),
+    ChangeShardConfig(ShardConfig),
 }

@@ -7,6 +7,7 @@ use rand::seq::IteratorRandom;
 use shared_types::{timestamp_now, TxID};
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use storage::config::ShardConfig;
 
 /// Caches limited announcements of specified file from different peers.
 struct AnnouncementCache {
@@ -125,6 +126,12 @@ impl AnnouncementCache {
         let result = self.items.values().cloned().collect();
         (result, collected)
     }
+
+    /// Removes announcement for the specified `peer_id` if any.
+    fn remove(&mut self, peer_id: &PeerId) -> Option<SignedAnnounceFile> {
+        self.priorities.remove(peer_id)?;
+        self.items.remove(peer_id)
+    }
 }
 
 /// Caches announcements for different files.
@@ -229,23 +236,55 @@ impl FileCache {
         self.update_on_announcement_cache_changed(&tx_id, collected);
         Some(result)
     }
+
+    /// Removes the announcement of specified file by `tx_id` and `peer_id`.
+    fn remove(&mut self, tx_id: &TxID, peer_id: &PeerId) -> Option<SignedAnnounceFile> {
+        let item = self.files.get_mut(tx_id)?;
+        let result = item.remove(peer_id)?;
+        self.update_on_announcement_cache_changed(tx_id, 1);
+        Some(result)
+    }
+}
+
+#[derive(Default)]
+pub struct PeerShardConfigCache {
+    peers: HashMap<PeerId, ShardConfig>,
+}
+
+impl PeerShardConfigCache {
+    pub fn insert(&mut self, peer: PeerId, config: ShardConfig) -> Option<ShardConfig> {
+        self.peers.insert(peer, config)
+    }
+
+    pub fn get(&self, peer: &PeerId) -> Option<ShardConfig> {
+        self.peers.get(peer).cloned()
+    }
 }
 
 pub struct FileLocationCache {
     cache: Mutex<FileCache>,
+    peer_cache: Mutex<PeerShardConfigCache>,
 }
 
 impl Default for FileLocationCache {
     fn default() -> Self {
         FileLocationCache {
             cache: Mutex::new(FileCache::new(Default::default())),
+            peer_cache: Mutex::new(Default::default()),
         }
     }
 }
 
 impl FileLocationCache {
     pub fn insert(&self, announcement: SignedAnnounceFile) {
+        let peer_id = *announcement.peer_id;
+        // FIXME: Check validity.
+        let shard_config = ShardConfig {
+            shard_id: announcement.shard_id,
+            num_shard: announcement.num_shard,
+        };
         self.cache.lock().insert(announcement);
+        self.insert_peer_config(peer_id, shard_config);
     }
 
     pub fn get_one(&self, tx_id: TxID) -> Option<SignedAnnounceFile> {
@@ -254,6 +293,23 @@ impl FileLocationCache {
 
     pub fn get_all(&self, tx_id: TxID) -> Vec<SignedAnnounceFile> {
         self.cache.lock().all(tx_id).unwrap_or_default()
+    }
+
+    pub fn remove(&self, tx_id: &TxID, peer_id: &PeerId) -> Option<SignedAnnounceFile> {
+        self.cache.lock().remove(tx_id, peer_id)
+    }
+
+    /// TODO: Trigger chunk_pool/sync to reconstruct if it changes?
+    pub fn insert_peer_config(
+        &self,
+        peer: PeerId,
+        shard_config: ShardConfig,
+    ) -> Option<ShardConfig> {
+        self.peer_cache.lock().insert(peer, shard_config)
+    }
+
+    pub fn get_peer_config(&self, peer: &PeerId) -> Option<ShardConfig> {
+        self.peer_cache.lock().get(peer)
     }
 }
 
