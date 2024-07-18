@@ -1,6 +1,6 @@
 [package]
 name = "zgs_node"
-version = "0.3.0"
+version = "0.3.4"
 edition = "2021"
 
 [dependencies]
@@ -36,6 +36,7 @@ itertools = "0.10.5"
 serde = { version = "1.0.137", features = ["derive"] }
 duration-str = "0.5.1"
 config = "0.13.1"
+public-ip = "0.2"
 
 [dependencies.libp2p]
 version = "0.45.1"

@@ -47,14 +47,14 @@ impl Store {
     delegate!(fn check_tx_completed(tx_seq: u64) -> Result<bool>);
     delegate!(fn get_chunk_by_tx_and_index(tx_seq: u64, index: usize) -> Result<Option<Chunk>>);
     delegate!(fn get_chunks_by_tx_and_index_range(tx_seq: u64, index_start: usize, index_end: usize) -> Result<Option<ChunkArray>>);
-    delegate!(fn get_chunks_with_proof_by_tx_and_index_range(tx_seq: u64, index_start: usize, index_end: usize) -> Result<Option<ChunkArrayWithProof>>);
+    delegate!(fn get_chunks_with_proof_by_tx_and_index_range(tx_seq: u64, index_start: usize, index_end: usize, merkle_tx_seq: Option<u64>) -> Result<Option<ChunkArrayWithProof>>);
     delegate!(fn get_tx_by_seq_number(seq: u64) -> Result<Option<Transaction>>);
     delegate!(fn put_chunks(tx_seq: u64, chunks: ChunkArray) -> Result<()>);
     delegate!(fn put_chunks_with_tx_hash(tx_seq: u64, tx_hash: H256, chunks: ChunkArray, maybe_file_proof: Option<FlowProof>) -> Result<bool>);
     delegate!(fn get_chunk_by_flow_index(index: u64, length: u64) -> Result<Option<ChunkArray>>);
     delegate!(fn finalize_tx(tx_seq: u64) -> Result<()>);
     delegate!(fn finalize_tx_with_hash(tx_seq: u64, tx_hash: H256) -> Result<bool>);
-    delegate!(fn get_proof_at_root(root: DataRoot, index: u64, length: u64) -> Result<FlowRangeProof>);
+    delegate!(fn get_proof_at_root(root: Option<DataRoot>, index: u64, length: u64) -> Result<FlowRangeProof>);
     delegate!(fn get_context() -> Result<(DataRoot, u64)>);
 
     pub async fn get_tx_seq_by_data_root(&self, data_root: &DataRoot) -> Result<Option<u64>> {

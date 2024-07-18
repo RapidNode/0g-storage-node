@@ -1,4 +1,4 @@
-use crate::types::NetworkInfo;
+use crate::types::{NetworkInfo, PeerInfo};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ pub trait Rpc {
 
     /// Terminate file or chunks sync for specified tx_seq.
     #[method(name = "terminateSync")]
-    async fn terminate_sync(&self, tx_seq: u64) -> RpcResult<()>;
+    async fn terminate_sync(&self, tx_seq: u64) -> RpcResult<bool>;
 
     #[method(name = "getSyncStatus")]
     async fn get_sync_status(&self, tx_seq: u64) -> RpcResult<String>;
@@ -32,4 +32,7 @@ pub trait Rpc {
 
     #[method(name = "getNetworkInfo")]
     async fn get_network_info(&self) -> RpcResult<NetworkInfo>;
+
+    #[method(name = "getPeers")]
+    async fn get_peers(&self) -> RpcResult<HashMap<String, PeerInfo>>;
 }

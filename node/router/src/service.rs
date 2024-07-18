@@ -10,7 +10,6 @@ use network::{
 };
 use pruner::PrunerMessage;
 use std::sync::Arc;
-use std::time::Duration;
 use storage::log_store::Store as LogStore;
 use storage_async::Store;
 use sync::{SyncMessage, SyncSender};
@@ -68,13 +67,14 @@ impl RouterService {
 
         // create the network service and spawn the task
         let router = RouterService {
-            config,
+            config: config.clone(),
             libp2p,
             network_globals: network_globals.clone(),
             network_recv,
             pruner_recv,
             peers: peers.clone(),
             libp2p_event_handler: Libp2pEventHandler::new(
+                config,
                 network_globals,
                 network_send,
                 sync_send,
@@ -94,7 +94,7 @@ impl RouterService {
     }
 
     async fn main(mut self, mut shutdown_sender: Sender<ShutdownReason>) {
-        let mut heartbeat = interval(Duration::from_secs(self.config.heartbeat_interval_secs));
+        let mut heartbeat = interval(self.config.heartbeat_interval);
 
         loop {
             tokio::select! {
@@ -125,7 +125,7 @@ impl RouterService {
         ev: Libp2pEvent<RequestId>,
         shutdown_sender: &mut Sender<ShutdownReason>,
     ) {
-        debug!(?ev, "Received new event from libp2p");
+        trace!(?ev, "Received new event from libp2p");
 
         match ev {
             Libp2pEvent::Behaviour(event) => match event {
@@ -194,6 +194,7 @@ impl RouterService {
                 }
             },
             Libp2pEvent::NewListenAddr(multiaddr) => {
+                info!(?multiaddr, "New listen address");
                 self.network_globals
                     .listen_multiaddrs
                     .write()
@@ -221,7 +222,7 @@ impl RouterService {
         msg: NetworkMessage,
         _shutdown_sender: &mut Sender<ShutdownReason>,
     ) {
-        debug!(?msg, "Received new message");
+        trace!(?msg, "Received new message");
 
         match msg {
             NetworkMessage::SendRequest {

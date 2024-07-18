@@ -1,4 +1,6 @@
-use crate::auto_sync::AutoSyncManager;
+use crate::auto_sync::batcher_random::RandomBatcher;
+use crate::auto_sync::batcher_serial::SerialBatcher;
+use crate::auto_sync::sync_store::SyncStore;
 use crate::context::SyncNetworkContext;
 use crate::controllers::{
     FailureReason, FileSyncGoal, FileSyncInfo, SerialSyncController, SyncState,
@@ -15,6 +17,7 @@ use network::{
     PeerRequestId, SyncId as RequestId,
 };
 use shared_types::{bytes_to_chunks, ChunkArrayWithProof, TxID};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::{hash_map::Entry, HashMap},
     sync::Arc,
@@ -23,7 +26,8 @@ use storage::config::ShardConfig;
 use storage::error::Result as StorageResult;
 use storage::log_store::Store as LogStore;
 use storage_async::Store;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 const HEARTBEAT_INTERVAL_SEC: u64 = 5;
 
@@ -122,7 +126,7 @@ pub struct SyncService {
     /// Heartbeat interval for executing periodic tasks.
     heartbeat: tokio::time::Interval,
 
-    manager: AutoSyncManager,
+    file_announcement_send: Option<UnboundedSender<u64>>,
 }
 
 impl SyncService {
@@ -132,6 +136,7 @@ impl SyncService {
         store: Arc<dyn LogStore>,
         file_location_cache: Arc<FileLocationCache>,
         event_recv: broadcast::Receiver<LogSyncEvent>,
+        catch_up_end_recv: oneshot::Receiver<()>,
     ) -> Result<SyncSender> {
         Self::spawn_with_config(
             Config::default(),
@@ -140,6 +145,7 @@ impl SyncService {
             store,
             file_location_cache,
             event_recv,
+            catch_up_end_recv,
         )
         .await
     }
@@ -151,6 +157,7 @@ impl SyncService {
         store: Arc<dyn LogStore>,
         file_location_cache: Arc<FileLocationCache>,
         event_recv: broadcast::Receiver<LogSyncEvent>,
+        catch_up_end_recv: oneshot::Receiver<()>,
     ) -> Result<SyncSender> {
         let (sync_send, sync_recv) = channel::Channel::unbounded();
 
@@ -159,10 +166,39 @@ impl SyncService {
 
         let store = Store::new(store, executor.clone());
 
-        let manager = AutoSyncManager::new(store.clone(), sync_send.clone(), config).await?;
-        if config.auto_sync_enabled {
-            manager.spwn(&executor, event_recv);
-        }
+        // init auto sync
+        let file_announcement_send = if config.auto_sync_enabled {
+            let (send, recv) = unbounded_channel();
+            let sync_store = Arc::new(SyncStore::new(store.clone()));
+            let catched_up = Arc::new(AtomicBool::new(false));
+
+            // sync in sequence
+            let serial_batcher =
+                SerialBatcher::new(config, store.clone(), sync_send.clone(), sync_store.clone())
+                    .await?;
+            executor.spawn(
+                serial_batcher.start(recv, event_recv, catched_up.clone()),
+                "auto_sync_serial",
+            );
+
+            // sync randomly
+            let random_batcher =
+                RandomBatcher::new(config, store.clone(), sync_send.clone(), sync_store);
+            executor.spawn(random_batcher.start(catched_up.clone()), "auto_sync_random");
+
+            // handle on catched up notification
+            executor.spawn(
+                async move {
+                    catch_up_end_recv.await.expect("Catch up sender dropped");
+                    catched_up.store(true, Ordering::Relaxed);
+                },
+                "auto_sync_wait_for_catchup",
+            );
+
+            Some(send)
+        } else {
+            None
+        };
 
         let mut sync = SyncService {
             config,
@@ -172,7 +208,7 @@ impl SyncService {
             file_location_cache,
             controllers: Default::default(),
             heartbeat,
-            manager,
+            file_announcement_send,
         };
 
         info!("Starting sync service");
@@ -199,7 +235,7 @@ impl SyncService {
     }
 
     async fn on_sync_msg(&mut self, msg: SyncMessage) {
-        debug!("Sync received message {:?}", msg);
+        trace!("Sync received message {:?}", msg);
 
         match msg {
             SyncMessage::DailFailed { peer_id, err } => {
@@ -427,6 +463,7 @@ impl SyncService {
                 request.tx_id.seq,
                 request.index_start as usize,
                 request.index_end as usize,
+                Some(request.merkle_tx_seq),
             )
             .await?;
 
@@ -604,9 +641,11 @@ impl SyncService {
 
     async fn on_announce_file_gossip(&mut self, tx_id: TxID, peer_id: PeerId, addr: Multiaddr) {
         let tx_seq = tx_id.seq;
-        debug!(%tx_seq, %peer_id, %addr, "Received AnnounceFile gossip");
+        trace!(%tx_seq, %peer_id, %addr, "Received AnnounceFile gossip");
 
-        self.manager.update_on_announcement(tx_seq).await;
+        if let Some(send) = &self.file_announcement_send {
+            let _ = send.send(tx_seq);
+        }
 
         // File already in sync
         if let Some(controller) = self.controllers.get_mut(&tx_seq) {
@@ -751,6 +790,7 @@ mod tests {
         network_send: UnboundedSender<NetworkMessage>,
         network_recv: UnboundedReceiver<NetworkMessage>,
         event_send: broadcast::Sender<LogSyncEvent>,
+        catch_up_end_recv: Option<oneshot::Receiver<()>>,
     }
 
     impl Default for TestSyncRuntime {
@@ -767,6 +807,7 @@ mod tests {
             let init_peer_id = identity::Keypair::generate_ed25519().public().to_peer_id();
             let (network_send, network_recv) = mpsc::unbounded_channel::<NetworkMessage>();
             let (event_send, _) = broadcast::channel(16);
+            let (_, catch_up_end_recv) = oneshot::channel();
 
             let tx_ids = txs.iter().take(seq_size).map(|tx| tx.id()).collect();
 
@@ -782,16 +823,17 @@ mod tests {
                 network_send,
                 network_recv,
                 event_send,
+                catch_up_end_recv: Some(catch_up_end_recv),
             }
         }
 
-        async fn spawn_sync_service(&self, with_peer_store: bool) -> SyncSender {
+        async fn spawn_sync_service(&mut self, with_peer_store: bool) -> SyncSender {
             self.spawn_sync_service_with_config(with_peer_store, Config::default())
                 .await
         }
 
         async fn spawn_sync_service_with_config(
-            &self,
+            &mut self,
             with_peer_store: bool,
             config: Config,
         ) -> SyncSender {
@@ -808,6 +850,7 @@ mod tests {
                 store,
                 self.file_location_cache.clone(),
                 self.event_send.subscribe(),
+                self.catch_up_end_recv.take().unwrap(),
             )
             .await
             .unwrap()
@@ -827,12 +870,9 @@ mod tests {
             create_file_location_cache(init_peer_id, vec![txs[0].id()]);
 
         let (network_send, mut network_recv) = mpsc::unbounded_channel::<NetworkMessage>();
-        let (sync_send, sync_recv) = channel::Channel::unbounded();
+        let (_, sync_recv) = channel::Channel::unbounded();
 
         let heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SEC));
-        let manager = AutoSyncManager::new(store.clone(), sync_send, Config::default())
-            .await
-            .unwrap();
 
         let mut sync = SyncService {
             config: Config::default(),
@@ -842,7 +882,7 @@ mod tests {
             file_location_cache,
             controllers: Default::default(),
             heartbeat,
-            manager,
+            file_announcement_send: None,
         };
 
         sync.on_peer_connected(init_peer_id);
@@ -862,12 +902,9 @@ mod tests {
             create_file_location_cache(init_peer_id, vec![txs[0].id()]);
 
         let (network_send, mut network_recv) = mpsc::unbounded_channel::<NetworkMessage>();
-        let (sync_send, sync_recv) = channel::Channel::unbounded();
+        let (_, sync_recv) = channel::Channel::unbounded();
 
         let heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SEC));
-        let manager = AutoSyncManager::new(store.clone(), sync_send, Config::default())
-            .await
-            .unwrap();
 
         let mut sync = SyncService {
             config: Config::default(),
@@ -877,7 +914,7 @@ mod tests {
             file_location_cache,
             controllers: Default::default(),
             heartbeat,
-            manager,
+            file_announcement_send: None,
         };
 
         sync.on_peer_disconnected(init_peer_id);
@@ -893,6 +930,7 @@ mod tests {
             tx_id: runtime.txs[0].id(),
             index_start: 0,
             index_end: runtime.chunk_count as u64,
+            merkle_tx_seq: 0,
         };
 
         sync_send
@@ -953,6 +991,7 @@ mod tests {
             tx_id: runtime.txs[0].id(),
             index_start: 0,
             index_end: 0_u64,
+            merkle_tx_seq: 0,
         };
 
         sync_send
@@ -1006,6 +1045,7 @@ mod tests {
             },
             index_start: 0,
             index_end: runtime.chunk_count as u64,
+            merkle_tx_seq: 1,
         };
 
         sync_send
@@ -1056,6 +1096,7 @@ mod tests {
             tx_id: runtime.txs[0].id(),
             index_start: 0,
             index_end: runtime.chunk_count as u64 + 1,
+            merkle_tx_seq: 0,
         };
 
         sync_send
@@ -1108,6 +1149,7 @@ mod tests {
             tx_id: runtime.txs[0].id(),
             index_start: 0,
             index_end: runtime.chunk_count as u64,
+            merkle_tx_seq: 0,
         };
 
         sync_send
@@ -1183,6 +1225,7 @@ mod tests {
 
         let (network_send, mut network_recv) = mpsc::unbounded_channel::<NetworkMessage>();
         let (_event_send, event_recv) = broadcast::channel(16);
+        let (_, catch_up_end_recv) = oneshot::channel();
         let sync_send = SyncService::spawn_with_config(
             Config::default(),
             runtime.task_executor.clone(),
@@ -1190,6 +1233,7 @@ mod tests {
             store.clone(),
             file_location_cache,
             event_recv,
+            catch_up_end_recv,
         )
         .await
         .unwrap();
@@ -1529,7 +1573,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_status_unknown() {
-        let runtime = TestSyncRuntime::default();
+        let mut runtime = TestSyncRuntime::default();
         let sync_send = runtime.spawn_sync_service(false).await;
 
         assert!(matches!(
@@ -1637,6 +1681,7 @@ mod tests {
                             tx_seq,
                             req.index_start as usize,
                             req.index_end as usize,
+                            None,
                         )
                         .unwrap()
                         .unwrap();

@@ -1,5 +1,5 @@
 use super::api::RpcServer;
-use crate::types::NetworkInfo;
+use crate::types::{NetworkInfo, PeerInfo};
 use crate::{error, Context};
 use futures::prelude::*;
 use jsonrpsee::core::async_trait;
@@ -78,7 +78,7 @@ impl RpcServer for RpcServerImpl {
     }
 
     #[tracing::instrument(skip(self), err)]
-    async fn terminate_sync(&self, tx_seq: u64) -> RpcResult<()> {
+    async fn terminate_sync(&self, tx_seq: u64) -> RpcResult<bool> {
         info!("admin_terminateSync({tx_seq})");
 
         let response = self
@@ -90,7 +90,7 @@ impl RpcServer for RpcServerImpl {
             .await?;
 
         match response {
-            SyncResponse::TerminateFileSync { .. } => Ok(()),
+            SyncResponse::TerminateFileSync { count } => Ok(count > 0),
             _ => Err(error::internal_error("unexpected response type")),
         }
     }
@@ -138,6 +138,7 @@ impl RpcServer for RpcServerImpl {
 
         Ok(NetworkInfo {
             peer_id: self.ctx.network_globals.local_peer_id().to_base58(),
+            listen_addresses: self.ctx.network_globals.listen_multiaddrs(),
             total_peers: db.peers().count(),
             banned_peers: db.banned_peers().count(),
             disconnected_peers: db.disconnected_peers().count(),
@@ -145,5 +146,18 @@ impl RpcServer for RpcServerImpl {
             connected_outgoing_peers,
             connected_incoming_peers: connected_peers - connected_outgoing_peers,
         })
+    }
+
+    async fn get_peers(&self) -> RpcResult<HashMap<String, PeerInfo>> {
+        info!("admin_getPeers()");
+
+        Ok(self
+            .ctx
+            .network_globals
+            .peers
+            .read()
+            .peers()
+            .map(|(peer_id, info)| (peer_id.to_base58(), info.into()))
+            .collect())
     }
 }
