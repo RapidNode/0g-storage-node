@@ -2353,6 +2353,7 @@ dependencies = [
  "parking_lot 0.12.3",
  "priority-queue",
  "rand 0.8.5",
+ "serde",
  "shared_types",
  "storage",
  "tracing",
@@ -5823,6 +5824,9 @@ name = "pruner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "contract-interface",
+ "ethereum-types 0.14.1",
+ "ethers",
  "miner",
  "rand 0.8.5",
  "storage",
@@ -5830,6 +5834,7 @@ dependencies = [
  "task_executor",
  "tokio",
  "tracing",
+ "zgs_spec",
 ]
 
 [[package]]
@@ -6308,6 +6313,7 @@ dependencies = [
  "append_merkle",
  "base64 0.13.1",
  "chunk_pool",
+ "file_location_cache",
  "futures",
  "futures-channel",
  "jsonrpsee",
@@ -8536,7 +8542,7 @@ dependencies = [
 
 [[package]]
 name = "zgs_node"
-version = "0.3.4"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "chunk_pool",

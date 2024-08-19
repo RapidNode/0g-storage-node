@@ -15,7 +15,7 @@ from pathlib import Path
 
 from eth_utils import encode_hex
 from test_framework.bsc_node import BSCNode
-from test_framework.contract_proxy import FlowContractProxy, MineContractProxy, IRewardContractProxy
+from test_framework.contract_proxy import FlowContractProxy, MineContractProxy, RewardContractProxy
 from test_framework.zgs_node import ZgsNode
 from test_framework.blockchain_node import BlockChainNodeType
 from test_framework.conflux_node import ConfluxNode, connect_sample_nodes
@@ -51,6 +51,7 @@ class TestFramework:
         self.block_time = blockchain_node_type.block_time()
         self.enable_market = False
         self.mine_period = 100
+        self.lifetime_seconds = 3600
         self.launch_wait_seconds = 1
 
         # Set default binary path
@@ -171,10 +172,10 @@ class TestFramework:
                 wait_until(lambda: node.eth_blockNumber() is not None)
                 wait_until(lambda: int(node.eth_blockNumber(), 16) > 0)
 
-        contract, tx_hash, mine_contract, reward_contract = self.blockchain_nodes[0].setup_contract(self.enable_market, self.mine_period)
+        contract, tx_hash, mine_contract, reward_contract = self.blockchain_nodes[0].setup_contract(self.enable_market, self.mine_period, self.lifetime_seconds)
         self.contract = FlowContractProxy(contract, self.blockchain_nodes)
         self.mine_contract = MineContractProxy(mine_contract, self.blockchain_nodes)
-        self.reward_contract = IRewardContractProxy(reward_contract, self.blockchain_nodes)
+        self.reward_contract = RewardContractProxy(reward_contract, self.blockchain_nodes)
 
 
         for node in self.blockchain_nodes[1:]:
@@ -197,6 +198,7 @@ class TestFramework:
                 updated_config,
                 self.contract.address(),
                 self.mine_contract.address(),
+                self.reward_contract.address(),
                 self.log,
             )
             self.nodes.append(node)
@@ -256,7 +258,7 @@ class TestFramework:
             dest="contract",
             default=os.path.join(
                 __file_path__,
-                "../../0g-storage-contracts/",
+                "../../storage-contracts-abis/",
             ),
             type=str,
         )

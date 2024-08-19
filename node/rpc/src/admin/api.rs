@@ -1,11 +1,14 @@
-use crate::types::{NetworkInfo, PeerInfo};
+use crate::types::{LocationInfo, NetworkInfo, PeerInfo};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use std::collections::HashMap;
-use sync::FileSyncInfo;
+use sync::{FileSyncInfo, SyncServiceState};
 
 #[rpc(server, client, namespace = "admin")]
 pub trait Rpc {
+    #[method(name = "findFile")]
+    async fn find_file(&self, tx_seq: u64) -> RpcResult<()>;
+
     #[method(name = "shutdown")]
     async fn shutdown(&self) -> RpcResult<()>;
 
@@ -24,6 +27,9 @@ pub trait Rpc {
     #[method(name = "terminateSync")]
     async fn terminate_sync(&self, tx_seq: u64) -> RpcResult<bool>;
 
+    #[method(name = "getSyncServiceState")]
+    async fn get_sync_service_state(&self) -> RpcResult<SyncServiceState>;
+
     #[method(name = "getSyncStatus")]
     async fn get_sync_status(&self, tx_seq: u64) -> RpcResult<String>;
 
@@ -35,4 +41,11 @@ pub trait Rpc {
 
     #[method(name = "getPeers")]
     async fn get_peers(&self) -> RpcResult<HashMap<String, PeerInfo>>;
+
+    #[method(name = "getFileLocation")]
+    async fn get_file_location(
+        &self,
+        tx_seq: u64,
+        all_shards: bool,
+    ) -> RpcResult<Option<Vec<LocationInfo>>>;
 }

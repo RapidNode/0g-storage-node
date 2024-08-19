@@ -63,9 +63,9 @@ build_config! {
 
     // db
     (db_dir, (String), "db".to_string())
-    (db_max_num_chunks, (Option<usize>), None)
+    (db_max_num_sectors, (Option<usize>), None)
     (prune_check_time_s, (u64), 60)
-    (prune_batch_size, (usize), 1024)
+    (prune_batch_size, (usize), 16 * 1024)
     (prune_batch_wait_time_ms, (u64), 1000)
 
     // misc
@@ -79,6 +79,7 @@ build_config! {
     (miner_submission_gas, (Option<u64>), None)
     (miner_cpu_percentage, (u64), 100)
     (mine_iter_batch_size, (usize), 100)
+    (reward_contract_address, (String), "".to_string())
     (shard_position, (Option<String>), None)
 }
 
@@ -92,6 +93,9 @@ pub struct ZgsConfig {
 
     // sync config, configured by [sync] section by `config` crate.
     pub sync: sync::Config,
+
+    // file location cache config, configured by [file_location_cache] section by `config` crate.
+    pub file_location_cache: file_location_cache::Config,
 }
 
 impl Deref for ZgsConfig {

@@ -1,9 +1,11 @@
 use crate::{controllers::SyncState, Config, SyncRequest, SyncResponse, SyncSender};
 use anyhow::{bail, Result};
-use std::fmt::Debug;
+use serde::{Deserialize, Serialize};
+use std::{collections::HashSet, fmt::Debug, sync::Arc};
 use storage_async::Store;
+use tokio::sync::RwLock;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum SyncResult {
     Completed,
     Failed,
@@ -11,18 +13,13 @@ pub enum SyncResult {
 }
 
 /// Supports to sync files concurrently.
+#[derive(Clone)]
 pub struct Batcher {
-    config: Config,
+    pub(crate) config: Config,
     capacity: usize,
-    tasks: Vec<u64>, // files to sync
+    tasks: Arc<RwLock<HashSet<u64>>>, // files to sync
     store: Store,
     sync_send: SyncSender,
-}
-
-impl Debug for Batcher {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.tasks)
-    }
 }
 
 impl Batcher {
@@ -36,45 +33,46 @@ impl Batcher {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.tasks.len()
+    pub async fn tasks(&self) -> Vec<u64> {
+        let mut result: Vec<u64> = self.tasks.read().await.iter().copied().collect();
+        result.sort();
+        result
     }
 
-    pub async fn add(&mut self, tx_seq: u64) -> Result<bool> {
-        // limits the number of threads
-        if self.tasks.len() >= self.capacity {
-            return Ok(false);
-        }
-
+    pub async fn add(&self, tx_seq: u64) -> Result<bool> {
         // requires log entry available before file sync
         if self.store.get_tx_by_seq_number(tx_seq).await?.is_none() {
             return Ok(false);
         }
 
-        self.tasks.push(tx_seq);
+        let mut tasks = self.tasks.write().await;
 
-        Ok(true)
+        // limits the number of threads
+        if tasks.len() >= self.capacity {
+            return Ok(false);
+        }
+
+        Ok(tasks.insert(tx_seq))
     }
 
-    pub fn reorg(&mut self, reverted_tx_seq: u64) {
-        self.tasks.retain(|&x| x < reverted_tx_seq);
+    pub async fn reorg(&self, reverted_tx_seq: u64) {
+        self.tasks.write().await.retain(|&x| x < reverted_tx_seq);
     }
 
     /// Poll the sync result of any completed file sync.
-    pub async fn poll(&mut self) -> Result<Option<(u64, SyncResult)>> {
+    pub async fn poll(&self) -> Result<Option<(u64, SyncResult)>> {
         let mut result = None;
-        let mut index = self.tasks.len();
+        let tasks = self.tasks.read().await.clone();
 
-        for (i, tx_seq) in self.tasks.iter().enumerate() {
+        for tx_seq in tasks.iter() {
             if let Some(ret) = self.poll_tx(*tx_seq).await? {
                 result = Some((*tx_seq, ret));
-                index = i;
                 break;
             }
         }
 
-        if index < self.tasks.len() {
-            self.tasks.swap_remove(index);
+        if let Some((tx_seq, _)) = &result {
+            self.tasks.write().await.remove(tx_seq);
         }
 
         Ok(result)
@@ -82,7 +80,9 @@ impl Batcher {
 
     async fn poll_tx(&self, tx_seq: u64) -> Result<Option<SyncResult>> {
         // file already exists
-        if self.store.check_tx_completed(tx_seq).await? {
+        if self.store.check_tx_completed(tx_seq).await?
+            || self.store.check_tx_pruned(tx_seq).await?
+        {
             // File may be finalized during file sync, e.g. user uploaded file via RPC.
             // In this case, just terminate the file sync.
             let num_terminated = self.terminate_file_sync(tx_seq, false).await;
@@ -126,11 +126,20 @@ impl Batcher {
                 Ok(Some(SyncResult::Failed))
             }
 
-            // file sync timeout
+            // finding peers timeout
             Some(SyncState::FindingPeers { origin, .. })
                 if origin.elapsed() > self.config.find_peer_timeout =>
             {
                 debug!(%tx_seq, "Terminate file sync due to finding peers timeout");
+                self.terminate_file_sync(tx_seq, false).await;
+                Ok(Some(SyncResult::Timeout))
+            }
+
+            // connecting peers timeout
+            Some(SyncState::ConnectingPeers { origin, .. })
+                if origin.elapsed() > self.config.find_peer_timeout =>
+            {
+                debug!(%tx_seq, "Terminate file sync due to connecting peers timeout");
                 self.terminate_file_sync(tx_seq, false).await;
                 Ok(Some(SyncResult::Timeout))
             }

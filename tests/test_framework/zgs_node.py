@@ -22,6 +22,7 @@ class ZgsNode(TestNode):
         updated_config,
         log_contract_address,
         mine_contract_address,
+        reward_contract_address,
         log,
         rpc_timeout=10,
         libp2p_nodes=None,
@@ -43,6 +44,7 @@ class ZgsNode(TestNode):
             "network_libp2p_nodes": libp2p_nodes,
             "log_contract_address": log_contract_address,
             "mine_contract_address": mine_contract_address,
+            "reward_contract_address": reward_contract_address,
             "blockchain_rpc_endpoint": f"http://127.0.0.1:{blockchain_rpc_port(0)}",
         }
         # Set configs for this specific node.
@@ -113,6 +115,9 @@ class ZgsNode(TestNode):
     def sync_status_is_completed_or_unknown(self, tx_seq):
         status = self.rpc.admin_getSyncStatus([tx_seq])
         return status == "Completed" or status == "unknown"
+    
+    def admin_get_file_location(self, tx_seq, all_shards = True):
+        return self.rpc.admin_getFileLocation([tx_seq, all_shards])
 
     def clean_data(self):
         shutil.rmtree(os.path.join(self.data_dir, "db"))

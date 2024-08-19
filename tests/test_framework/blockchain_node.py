@@ -253,7 +253,7 @@ class BlockchainNode(TestNode):
     def wait_for_transaction_receipt(self, w3, tx_hash, timeout=120, parent_hash=None):
         return w3.eth.wait_for_transaction_receipt(tx_hash, timeout)
 
-    def setup_contract(self, enable_market, mine_period):
+    def setup_contract(self, enable_market, mine_period, lifetime_seconds):
         w3 = Web3(HTTPProvider(self.rpc_url))
 
         account1 = w3.eth.account.from_key(GENESIS_PRIV_KEY)
@@ -267,7 +267,7 @@ class BlockchainNode(TestNode):
         def deploy_contract(name, args=None):
             if args is None:
                 args = []
-            contract_interface = load_contract_metadata(base_path=self.contract_path, name=name)
+            contract_interface = load_contract_metadata(path=self.contract_path, name=name)
             contract = w3.eth.contract(
                 abi=contract_interface["abi"],
                 bytecode=contract_interface["bytecode"],
@@ -303,7 +303,7 @@ class BlockchainNode(TestNode):
             mine_contract.functions.setTargetSubmissions(2).transact(TX_PARAMS)
             self.log.debug("Mine Initialized")
 
-            flow_initialize_hash = (flow_contract.get_function_by_signature('initialize(address)'))(dummy_market_contract.address).transact(TX_PARAMS)
+            flow_initialize_hash = flow_contract.functions.initialize(dummy_market_contract.address).transact(TX_PARAMS)
             self.log.debug("Flow Initialized")
 
             self.wait_for_transaction_receipt(w3, flow_initialize_hash)
@@ -314,9 +314,7 @@ class BlockchainNode(TestNode):
 
             return flow_contract, flow_initialize_hash, mine_contract, dummy_reward_contract
         
-        def deploy_with_market():
-            LIFETIME_MONTH = 1
-
+        def deploy_with_market(lifetime_seconds):
             self.log.debug("Start deploy contracts")
             
             mine_contract, _ = deploy_contract("PoraMineTest", [0])
@@ -325,7 +323,7 @@ class BlockchainNode(TestNode):
             market_contract, _ = deploy_contract("FixedPrice", [])
             self.log.debug("Market deployed")
             
-            reward_contract, _ =deploy_contract("OnePoolReward", [LIFETIME_MONTH])
+            reward_contract, _ = deploy_contract("ChunkLinearReward", [lifetime_seconds])
             self.log.debug("Reward deployed")
             
             flow_contract, _ = deploy_contract("FixedPriceFlow", [mine_period, 0])
@@ -336,13 +334,16 @@ class BlockchainNode(TestNode):
             mine_contract.functions.setTargetSubmissions(2).transact(TX_PARAMS)
             self.log.debug("Mine Initialized")
             
-            market_contract.functions.initialize(LIFETIME_MONTH, flow_contract.address, reward_contract.address).transact(TX_PARAMS)
+            market_contract.functions.initialize(int(lifetime_seconds * 256 * 10 * 10 ** 18 /
+                                                     2 ** 30 / 12 / 31 / 86400),
+                                                 flow_contract.address, reward_contract.address).transact(TX_PARAMS)
             self.log.debug("Market Initialized")
             
             reward_contract.functions.initialize(market_contract.address, mine_contract.address).transact(TX_PARAMS)
+            reward_contract.functions.setBaseReward(10 ** 18).transact(TX_PARAMS)
             self.log.debug("Reward Initialized")
             
-            flow_initialize_hash = (flow_contract.get_function_by_signature('initialize(address)'))(market_contract.address).transact(TX_PARAMS)
+            flow_initialize_hash = flow_contract.functions.initialize(market_contract.address).transact(TX_PARAMS)
             self.log.debug("Flow Initialized")
             
             self.wait_for_transaction_receipt(w3, flow_initialize_hash)
@@ -351,7 +352,7 @@ class BlockchainNode(TestNode):
             return flow_contract, flow_initialize_hash, mine_contract, reward_contract
         
         if enable_market:
-            return deploy_with_market()
+            return deploy_with_market(lifetime_seconds)
         else:
             return deploy_no_market()
 

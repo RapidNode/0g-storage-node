@@ -1,9 +1,7 @@
 use super::{batcher::Batcher, sync_store::SyncStore};
-use crate::{
-    auto_sync::{batcher::SyncResult, INTERVAL_ERROR, INTERVAL_IDLE},
-    Config, SyncSender,
-};
+use crate::{auto_sync::batcher::SyncResult, Config, SyncSender};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -11,6 +9,15 @@ use std::sync::{
 use storage_async::Store;
 use tokio::time::sleep;
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RandomBatcherState {
+    pub tasks: Vec<u64>,
+    pub pending_txs: usize,
+    pub ready_txs: usize,
+}
+
+#[derive(Clone)]
 pub struct RandomBatcher {
     batcher: Batcher,
     sync_store: Arc<SyncStore>,
@@ -24,10 +31,19 @@ impl RandomBatcher {
         sync_store: Arc<SyncStore>,
     ) -> Self {
         Self {
-            // now, only 1 thread to sync file randomly
-            batcher: Batcher::new(config, 1, store, sync_send),
+            batcher: Batcher::new(config, config.max_random_workers, store, sync_send),
             sync_store,
         }
+    }
+
+    pub async fn get_state(&self) -> Result<RandomBatcherState> {
+        let (pending_txs, ready_txs) = self.sync_store.stat().await?;
+
+        Ok(RandomBatcherState {
+            tasks: self.batcher.tasks().await,
+            pending_txs,
+            ready_txs,
+        })
     }
 
     pub async fn start(mut self, catched_up: Arc<AtomicBool>) {
@@ -37,7 +53,7 @@ impl RandomBatcher {
             // disable file sync until catched up
             if !catched_up.load(Ordering::Relaxed) {
                 trace!("Cannot sync file in catch-up phase");
-                sleep(INTERVAL_IDLE).await;
+                sleep(self.batcher.config.auto_sync_idle_interval).await;
                 continue;
             }
 
@@ -45,14 +61,14 @@ impl RandomBatcher {
                 Ok(true) => {}
                 Ok(false) => {
                     trace!(
-                        "File sync still in progress or idle, {:?}",
-                        self.stat().await
+                        "File sync still in progress or idle, state = {:?}",
+                        self.get_state().await
                     );
-                    sleep(INTERVAL_IDLE).await;
+                    sleep(self.batcher.config.auto_sync_idle_interval).await;
                 }
                 Err(err) => {
-                    warn!(%err, "Failed to sync file once, {:?}", self.stat().await);
-                    sleep(INTERVAL_ERROR).await;
+                    warn!(%err, "Failed to sync file once, state = {:?}", self.get_state().await);
+                    sleep(self.batcher.config.auto_sync_error_interval).await;
                 }
             }
         }
@@ -69,7 +85,7 @@ impl RandomBatcher {
             None => return Ok(false),
         };
 
-        debug!(%tx_seq, ?sync_result, "Completed to sync file, {:?}", self.stat().await);
+        debug!(%tx_seq, ?sync_result, "Completed to sync file, state = {:?}", self.get_state().await);
 
         match sync_result {
             SyncResult::Completed => self.sync_store.remove_tx(tx_seq).await?,
@@ -80,10 +96,6 @@ impl RandomBatcher {
     }
 
     async fn schedule(&mut self) -> Result<bool> {
-        if self.batcher.len() > 0 {
-            return Ok(false);
-        }
-
         let tx_seq = match self.sync_store.random_tx().await? {
             Some(v) => v,
             None => return Ok(false),
@@ -93,21 +105,8 @@ impl RandomBatcher {
             return Ok(false);
         }
 
-        debug!("Pick a file to sync, {:?}", self.stat().await);
+        debug!("Pick a file to sync, state = {:?}", self.get_state().await);
 
         Ok(true)
-    }
-
-    async fn stat(&self) -> String {
-        match self.sync_store.stat().await {
-            Ok((num_pending_txs, num_ready_txs)) => format!(
-                "RandomBatcher {{ batcher = {:?}, pending_txs = {}, ready_txs = {}}}",
-                self.batcher, num_pending_txs, num_ready_txs
-            ),
-            Err(err) => format!(
-                "RandomBatcher {{ batcher = {:?}, pending_txs/ready_txs = Error({:?})}}",
-                self.batcher, err
-            ),
-        }
     }
 }
