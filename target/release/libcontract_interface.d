@@ -1,1 +1,0 @@
-/root/0g-storage-node/target/release/libcontract_interface.rlib: /root/0g-storage-node/common/contract-interface/../../0g-storage-contracts/artifacts/ /root/0g-storage-node/common/contract-interface/build.rs /root/0g-storage-node/common/contract-interface/src/lib.rs

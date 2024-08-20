@@ -1,1 +1,0 @@
-{"rustc":2497478894085024098,"features":"","target":0,"profile":0,"path":0,"deps":[[13033313677425184233,"build_script_build",false,164939248454482416]],"local":[{"RerunIfChanged":{"output":"release/build/contract-interface-a2f28b0c5f09bac7/output","paths":["../../0g-storage-contracts/artifacts/"]}}],"rustflags":[],"metadata":0,"config":0,"compile_kind":0}

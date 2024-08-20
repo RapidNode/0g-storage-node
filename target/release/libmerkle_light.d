@@ -1,1 +1,0 @@
-/root/0g-storage-node/target/release/libmerkle_light.rlib: /root/0g-storage-node/common/merkle_light/src/hash.rs /root/0g-storage-node/common/merkle_light/src/hash_impl.rs /root/0g-storage-node/common/merkle_light/src/lib.rs /root/0g-storage-node/common/merkle_light/src/merkle.rs /root/0g-storage-node/common/merkle_light/src/proof.rs

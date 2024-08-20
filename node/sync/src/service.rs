@@ -15,6 +15,7 @@ use network::{
     PeerRequestId, SyncId as RequestId,
 };
 use shared_types::{bytes_to_chunks, timestamp_now, ChunkArrayWithProof, TxID};
+use std::sync::atomic::Ordering;
 use std::{
     collections::{hash_map::Entry, HashMap},
     sync::Arc,
@@ -275,11 +276,13 @@ impl SyncService {
                 let state = match &self.auto_sync_manager {
                     Some(manager) => SyncServiceState {
                         num_syncing: self.controllers.len(),
+                        catched_up: Some(manager.catched_up.load(Ordering::Relaxed)),
                         auto_sync_serial: Some(manager.serial.get_state().await),
                         auto_sync_random: manager.random.get_state().await.ok(),
                     },
                     None => SyncServiceState {
                         num_syncing: self.controllers.len(),
+                        catched_up: None,
                         auto_sync_serial: None,
                         auto_sync_random: None,
                     },
@@ -749,7 +752,7 @@ impl SyncService {
                     to_terminate.push(*tx_seq);
                 }
             }
-        } else {
+        } else if self.controllers.contains_key(&min_tx_seq) {
             to_terminate.push(min_tx_seq);
         }
 
@@ -757,9 +760,12 @@ impl SyncService {
             self.controllers.remove(tx_seq);
         }
 
-        debug!(?to_terminate, "File sync terminated");
+        let num_terminated = to_terminate.len();
+        if num_terminated > 0 {
+            debug!(?to_terminate, "File sync terminated");
+        }
 
-        to_terminate.len()
+        num_terminated
     }
 
     fn on_heartbeat(&mut self) {

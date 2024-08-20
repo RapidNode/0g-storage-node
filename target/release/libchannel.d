@@ -1,1 +1,0 @@
-/root/0g-storage-node/target/release/libchannel.rlib: /root/0g-storage-node/common/channel/src/channel.rs /root/0g-storage-node/common/channel/src/error.rs /root/0g-storage-node/common/channel/src/lib.rs /root/0g-storage-node/common/channel/src/test_util.rs

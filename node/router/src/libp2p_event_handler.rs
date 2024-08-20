@@ -5,7 +5,6 @@ use chunk_pool::ChunkPoolMessage;
 use file_location_cache::FileLocationCache;
 use network::multiaddr::Protocol;
 use network::types::{AnnounceShardConfig, SignedAnnounceShardConfig};
-use network::Multiaddr;
 use network::{
     rpc::StatusMessage,
     types::{
@@ -15,29 +14,37 @@ use network::{
     Keypair, MessageAcceptance, MessageId, NetworkGlobals, NetworkMessage, PeerId, PeerRequestId,
     PublicKey, PubsubMessage, Request, RequestId, Response,
 };
-use shared_types::{bytes_to_chunks, timestamp_now, TxID};
+use network::{Multiaddr, PeerAction, ReportSource};
+use shared_types::{bytes_to_chunks, timestamp_now, NetworkIdentity, TxID};
 use storage::config::ShardConfig;
 use storage_async::Store;
 use sync::{SyncMessage, SyncSender};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, RwLock};
 
+use crate::metrics;
 use crate::peer_manager::PeerManager;
 use crate::Config;
 
 lazy_static::lazy_static! {
-    pub static ref FIND_FILE_TIMEOUT: chrono::Duration = chrono::Duration::minutes(2);
-    pub static ref ANNOUNCE_FILE_TIMEOUT: chrono::Duration = chrono::Duration::minutes(2);
-    pub static ref ANNOUNCE_SHARD_CONFIG_TIMEOUT: chrono::Duration = chrono::Duration::minutes(2);
-    pub static ref TOLERABLE_DRIFT: chrono::Duration = chrono::Duration::seconds(5);
+    pub static ref FIND_FILE_TIMEOUT: chrono::Duration = chrono::Duration::minutes(5);
+    pub static ref ANNOUNCE_FILE_TIMEOUT: chrono::Duration = chrono::Duration::minutes(5);
+    pub static ref ANNOUNCE_SHARD_CONFIG_TIMEOUT: chrono::Duration = chrono::Duration::minutes(5);
+    pub static ref TOLERABLE_DRIFT: chrono::Duration = chrono::Duration::seconds(10);
 }
 
-#[allow(deprecated)]
-fn duration_since(timestamp: u32) -> chrono::Duration {
+fn duration_since(timestamp: u32, metric: Arc<dyn ::metrics::Histogram>) -> chrono::Duration {
     let timestamp = i64::from(timestamp);
-    let timestamp = chrono::NaiveDateTime::from_timestamp_opt(timestamp, 0).expect("should fit");
-    let now = chrono::Utc::now().naive_utc();
-    now.signed_duration_since(timestamp)
+    let timestamp = chrono::DateTime::from_timestamp(timestamp, 0).expect("should fit");
+    let now = chrono::Utc::now();
+    let duration = now.signed_duration_since(timestamp);
+
+    let num_secs = duration.num_seconds();
+    if num_secs > 0 {
+        metric.update(num_secs as u64);
+    }
+
+    duration
 }
 
 fn peer_id_to_public_key(peer_id: &PeerId) -> Result<PublicKey, String> {
@@ -139,7 +146,9 @@ impl Libp2pEventHandler {
     }
 
     pub fn send_status(&self, peer_id: PeerId) {
-        let status_message = StatusMessage { data: 123 }; // dummy status message
+        let status_message = StatusMessage {
+            data: self.network_globals.network_id(),
+        };
         debug!(%peer_id, ?status_message, "Sending Status request");
 
         self.send_to_network(NetworkMessage::SendRequest {
@@ -147,6 +156,8 @@ impl Libp2pEventHandler {
             request_id: RequestId::Router,
             request: Request::Status(status_message),
         });
+
+        metrics::LIBP2P_SEND_STATUS.mark(1);
     }
 
     pub async fn on_peer_connected(&self, peer_id: PeerId, outgoing: bool) {
@@ -155,12 +166,16 @@ impl Libp2pEventHandler {
         if outgoing {
             self.send_status(peer_id);
             self.send_to_sync(SyncMessage::PeerConnected { peer_id });
+            metrics::LIBP2P_HANDLE_PEER_CONNECTED_OUTGOING.mark(1);
+        } else {
+            metrics::LIBP2P_HANDLE_PEER_CONNECTED_INCOMING.mark(1);
         }
     }
 
     pub async fn on_peer_disconnected(&self, peer_id: PeerId) {
         self.peers.write().await.remove(&peer_id);
         self.send_to_sync(SyncMessage::PeerDisconnected { peer_id });
+        metrics::LIBP2P_HANDLE_PEER_DISCONNECTED.mark(1);
     }
 
     pub async fn on_rpc_request(
@@ -174,6 +189,7 @@ impl Libp2pEventHandler {
         match request {
             Request::Status(status) => {
                 self.on_status_request(peer_id, request_id, status);
+                metrics::LIBP2P_HANDLE_REQUEST_STATUS.mark(1);
             }
             Request::GetChunks(request) => {
                 self.send_to_sync(SyncMessage::RequestChunks {
@@ -181,6 +197,7 @@ impl Libp2pEventHandler {
                     request_id,
                     request,
                 });
+                metrics::LIBP2P_HANDLE_REQUEST_GET_CHUNKS.mark(1);
             }
             Request::DataByHash(_) => {
                 // ignore
@@ -191,7 +208,10 @@ impl Libp2pEventHandler {
     fn on_status_request(&self, peer_id: PeerId, request_id: PeerRequestId, status: StatusMessage) {
         debug!(%peer_id, ?status, "Received Status request");
 
-        let status_message = StatusMessage { data: 456 }; // dummy status message
+        let network_id = self.network_globals.network_id();
+        let status_message = StatusMessage {
+            data: network_id.clone(),
+        };
         debug!(%peer_id, ?status_message, "Sending Status response");
 
         self.send_to_network(NetworkMessage::SendResponse {
@@ -199,6 +219,12 @@ impl Libp2pEventHandler {
             id: request_id,
             response: Response::Status(status_message),
         });
+        self.on_status_message(peer_id, status, network_id);
+    }
+
+    fn on_status_response(&self, peer_id: PeerId, status: StatusMessage) {
+        let network_id = self.network_globals.network_id();
+        self.on_status_message(peer_id, status, network_id);
     }
 
     pub async fn on_rpc_response(
@@ -212,6 +238,8 @@ impl Libp2pEventHandler {
         match response {
             Response::Status(status_message) => {
                 debug!(%peer_id, ?status_message, "Received Status response");
+                self.on_status_response(peer_id, status_message);
+                metrics::LIBP2P_HANDLE_RESPONSE_STATUS.mark(1);
             }
             Response::Chunks(response) => {
                 let request_id = match request_id {
@@ -224,6 +252,8 @@ impl Libp2pEventHandler {
                     request_id,
                     response,
                 });
+
+                metrics::LIBP2P_HANDLE_RESPONSE_GET_CHUNKS.mark(1);
             }
             Response::DataByHash(_) => {
                 // ignore
@@ -241,6 +271,8 @@ impl Libp2pEventHandler {
                 request_id,
             });
         }
+
+        metrics::LIBP2P_HANDLE_RESPONSE_ERROR.mark(1);
     }
 
     pub async fn on_pubsub_message(
@@ -254,11 +286,24 @@ impl Libp2pEventHandler {
 
         match message {
             PubsubMessage::ExampleMessage(_) => MessageAcceptance::Ignore,
-            PubsubMessage::FindFile(msg) => self.on_find_file(msg).await,
-            PubsubMessage::FindChunks(msg) => self.on_find_chunks(msg).await,
-            PubsubMessage::AnnounceFile(msg) => self.on_announce_file(propagation_source, msg),
-            PubsubMessage::AnnounceChunks(msg) => self.on_announce_chunks(propagation_source, msg),
+            PubsubMessage::FindFile(msg) => {
+                metrics::LIBP2P_HANDLE_PUBSUB_FIND_FILE.mark(1);
+                self.on_find_file(msg).await
+            }
+            PubsubMessage::FindChunks(msg) => {
+                metrics::LIBP2P_HANDLE_PUBSUB_FIND_CHUNKS.mark(1);
+                self.on_find_chunks(msg).await
+            }
+            PubsubMessage::AnnounceFile(msg) => {
+                metrics::LIBP2P_HANDLE_PUBSUB_ANNOUNCE_FILE.mark(1);
+                self.on_announce_file(propagation_source, msg)
+            }
+            PubsubMessage::AnnounceChunks(msg) => {
+                metrics::LIBP2P_HANDLE_PUBSUB_ANNOUNCE_CHUNKS.mark(1);
+                self.on_announce_chunks(propagation_source, msg)
+            }
             PubsubMessage::AnnounceShardConfig(msg) => {
+                metrics::LIBP2P_HANDLE_PUBSUB_ANNOUNCE_SHARD.mark(1);
                 self.on_announce_shard_config(propagation_source, msg)
             }
         }
@@ -389,9 +434,12 @@ impl Libp2pEventHandler {
         let FindFile { tx_id, timestamp } = msg;
 
         // verify timestamp
-        let d = duration_since(timestamp);
+        let d = duration_since(
+            timestamp,
+            metrics::LIBP2P_HANDLE_PUBSUB_LATENCY_FIND_FILE.clone(),
+        );
         if d < TOLERABLE_DRIFT.neg() || d > *FIND_FILE_TIMEOUT {
-            debug!(%timestamp, "Invalid timestamp, ignoring FindFile message");
+            debug!(%timestamp, ?d, "Invalid timestamp, ignoring FindFile message");
             return MessageAcceptance::Ignore;
         }
 
@@ -399,7 +447,7 @@ impl Libp2pEventHandler {
         if matches!(self.store.check_tx_completed(tx_id.seq).await, Ok(true)) {
             if let Ok(Some(tx)) = self.store.get_tx_by_seq_number(tx_id.seq).await {
                 if tx.id() == tx_id {
-                    debug!(?tx_id, "Found file locally, responding to FindFile query");
+                    trace!(?tx_id, "Found file locally, responding to FindFile query");
 
                     return match self.construct_announce_file_message(tx_id).await {
                         Some(msg) => {
@@ -415,7 +463,7 @@ impl Libp2pEventHandler {
 
         // try from cache
         if let Some(mut msg) = self.file_location_cache.get_one(tx_id) {
-            debug!(?tx_id, "Found file in cache, responding to FindFile query");
+            trace!(?tx_id, "Found file in cache, responding to FindFile query");
 
             msg.resend_timestamp = timestamp_now();
             self.publish(PubsubMessage::AnnounceFile(msg));
@@ -467,9 +515,12 @@ impl Libp2pEventHandler {
         }
 
         // verify timestamp
-        let d = duration_since(msg.timestamp);
+        let d = duration_since(
+            msg.timestamp,
+            metrics::LIBP2P_HANDLE_PUBSUB_LATENCY_FIND_CHUNKS.clone(),
+        );
         if d < TOLERABLE_DRIFT.neg() || d > *FIND_FILE_TIMEOUT {
-            debug!(%msg.timestamp, "Invalid timestamp, ignoring FindFile message");
+            debug!(%msg.timestamp, ?d, "Invalid timestamp, ignoring FindChunks message");
             return MessageAcceptance::Ignore;
         }
 
@@ -503,7 +554,7 @@ impl Libp2pEventHandler {
             _ => return MessageAcceptance::Accept,
         };
 
-        debug!(?msg, "Found chunks to respond FindChunks message");
+        trace!(?msg, "Found chunks to respond FindChunks message");
 
         match self
             .construct_announce_chunks_message(msg.tx_id, msg.index_start, msg.index_end)
@@ -535,10 +586,14 @@ impl Libp2pEventHandler {
             None => return false,
         };
 
+        metrics::LIBP2P_VERIFY_ANNOUNCED_IP.mark(1);
+
         let seen_ips: Vec<IpAddr> = match self.network_globals.peers.read().peer_info(peer_id) {
             Some(v) => v.seen_ip_addresses().collect(),
             None => {
-                debug!(%announced_ip, "Failed to verify announced IP address, no peer info found");
+                // ignore file announcement from un-seen peers
+                trace!(%announced_ip, "Failed to verify announced IP address, no peer info found");
+                metrics::LIBP2P_VERIFY_ANNOUNCED_IP_UNSEEN.mark(1);
                 return false;
             }
         };
@@ -546,7 +601,9 @@ impl Libp2pEventHandler {
         if seen_ips.iter().any(|x| *x == announced_ip) {
             true
         } else {
-            debug!(%announced_ip, ?seen_ips, "Failed to verify announced IP address, mismatch with seen ips");
+            // ignore file announcement if announced IP and seen IP mismatch
+            trace!(%announced_ip, ?seen_ips, "Failed to verify announced IP address, mismatch with seen ips");
+            metrics::LIBP2P_VERIFY_ANNOUNCED_IP_MISMATCH.mark(1);
             false
         }
     }
@@ -568,14 +625,20 @@ impl Libp2pEventHandler {
         }
 
         // verify announced ip address if required
-        if !self.config.private_ip_enabled && !self.verify_announced_address(&msg.peer_id, &addr) {
+        if !self.config.private_ip_enabled
+            && self.config.check_announced_ip
+            && !self.verify_announced_address(&msg.peer_id, &addr)
+        {
             return MessageAcceptance::Reject;
         }
 
         // propagate gossip to peers
-        let d = duration_since(msg.resend_timestamp);
+        let d = duration_since(
+            msg.resend_timestamp,
+            metrics::LIBP2P_HANDLE_PUBSUB_LATENCY_ANNOUNCE_FILE.clone(),
+        );
         if d < TOLERABLE_DRIFT.neg() || d > *ANNOUNCE_FILE_TIMEOUT {
-            debug!(%msg.resend_timestamp, "Invalid resend timestamp, ignoring AnnounceFile message");
+            debug!(%msg.resend_timestamp, ?d, "Invalid resend timestamp, ignoring AnnounceFile message");
             return MessageAcceptance::Ignore;
         }
 
@@ -609,14 +672,20 @@ impl Libp2pEventHandler {
         }
 
         // verify announced ip address if required
-        if !self.config.private_ip_enabled && !self.verify_announced_address(&msg.peer_id, &addr) {
+        if !self.config.private_ip_enabled
+            && self.config.check_announced_ip
+            && !self.verify_announced_address(&msg.peer_id, &addr)
+        {
             return MessageAcceptance::Reject;
         }
 
         // propagate gossip to peers
-        let d = duration_since(msg.resend_timestamp);
+        let d = duration_since(
+            msg.resend_timestamp,
+            metrics::LIBP2P_HANDLE_PUBSUB_LATENCY_ANNOUNCE_SHARD.clone(),
+        );
         if d < TOLERABLE_DRIFT.neg() || d > *ANNOUNCE_SHARD_CONFIG_TIMEOUT {
-            debug!(%msg.resend_timestamp, "Invalid resend timestamp, ignoring AnnounceShardConfig message");
+            debug!(%msg.resend_timestamp, ?d, "Invalid resend timestamp, ignoring AnnounceShardConfig message");
             return MessageAcceptance::Ignore;
         }
 
@@ -655,14 +724,20 @@ impl Libp2pEventHandler {
         }
 
         // verify announced ip address if required
-        if !self.config.private_ip_enabled && !self.verify_announced_address(&msg.peer_id, &addr) {
+        if !self.config.private_ip_enabled
+            && self.config.check_announced_ip
+            && !self.verify_announced_address(&msg.peer_id, &addr)
+        {
             return MessageAcceptance::Reject;
         }
 
         // propagate gossip to peers
-        let d = duration_since(msg.resend_timestamp);
+        let d = duration_since(
+            msg.resend_timestamp,
+            metrics::LIBP2P_HANDLE_PUBSUB_LATENCY_ANNOUNCE_CHUNKS.clone(),
+        );
         if d < TOLERABLE_DRIFT.neg() || d > *ANNOUNCE_FILE_TIMEOUT {
-            debug!(%msg.resend_timestamp, "Invalid resend timestamp, ignoring AnnounceChunks message");
+            debug!(%msg.resend_timestamp, ?d, "Invalid resend timestamp, ignoring AnnounceChunks message");
             return MessageAcceptance::Ignore;
         }
 
@@ -670,6 +745,23 @@ impl Libp2pEventHandler {
         self.send_to_sync(SyncMessage::AnnounceChunksGossip { msg: msg.inner });
 
         MessageAcceptance::Accept
+    }
+
+    fn on_status_message(
+        &self,
+        peer_id: PeerId,
+        status: StatusMessage,
+        network_id: NetworkIdentity,
+    ) {
+        if status.data != network_id {
+            warn!(%peer_id, ?network_id, ?status.data, "Report peer with incompatible network id");
+            self.send_to_network(NetworkMessage::ReportPeer {
+                peer_id,
+                action: PeerAction::Fatal,
+                source: ReportSource::Gossipsub,
+                msg: "Incompatible network id in StatusMessage",
+            })
+        }
     }
 }
 
@@ -762,7 +854,8 @@ mod tests {
             let keypair = Keypair::generate_secp256k1();
             let enr_key = CombinedKey::from_libp2p(&keypair).unwrap();
             let enr = EnrBuilder::new("v4").build(&enr_key).unwrap();
-            let network_globals = NetworkGlobals::new(enr, 30000, 30000, vec![]);
+            let network_globals =
+                NetworkGlobals::new(enr, 30000, 30000, vec![], Default::default());
 
             let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/30000".parse().unwrap();
             network_globals.listen_multiaddrs.write().push(listen_addr);
@@ -876,7 +969,9 @@ mod tests {
 
         let alice = PeerId::random();
         let req_id = (ConnectionId::new(4), SubstreamId(12));
-        let request = Request::Status(StatusMessage { data: 412 });
+        let request = Request::Status(StatusMessage {
+            data: Default::default(),
+        });
         handler.on_rpc_request(alice, req_id, request).await;
 
         match ctx.network_recv.try_recv() {
