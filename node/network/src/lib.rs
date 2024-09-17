@@ -25,6 +25,7 @@ pub mod types;
 
 pub use config::gossip_max_size;
 use std::net::SocketAddr;
+use std::time::Instant;
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use shared_types::TxID;
@@ -73,8 +74,6 @@ impl<'de> Deserialize<'de> for PeerIdSerialized {
 
 pub use crate::types::{error, Enr, GossipTopic, NetworkGlobals, PubsubMessage};
 
-pub use prometheus_client;
-
 pub use behaviour::{BehaviourEvent, Gossipsub, PeerRequestId, Request, Response};
 pub use config::Config as NetworkConfig;
 pub use discovery::{CombinedKeyExt, EnrExt};
@@ -94,11 +93,13 @@ pub use peer_manager::{
 };
 pub use service::{load_private_key, Context, Libp2pEvent, Service, NETWORK_KEY_FILENAME};
 
+pub const PROTOCOL_VERSION: [u8; 3] = [0, 1, 0];
+
 /// Application level requests sent to the network.
 #[derive(Debug, Clone, Copy)]
 pub enum RequestId {
-    Router,
-    Sync(SyncId),
+    Router(Instant),
+    Sync(Instant, SyncId),
 }
 
 #[derive(Debug, Clone, Copy)]

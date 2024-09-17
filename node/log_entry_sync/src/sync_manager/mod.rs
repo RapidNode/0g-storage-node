@@ -5,17 +5,18 @@ use anyhow::{anyhow, bail, Result};
 use ethereum_types::H256;
 use ethers::{prelude::Middleware, types::BlockNumber};
 use futures::FutureExt;
-use jsonrpsee::tracing::{debug, error, trace, warn};
+use jsonrpsee::tracing::{debug, error, warn};
 use shared_types::{ChunkArray, Transaction};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use storage::log_store::{tx_store::BlockHashAndSubmissionIndex, Store};
 use task_executor::{ShutdownReason, TaskExecutor};
+use thiserror::Error;
 use tokio::sync::broadcast;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, RwLock};
 
 const RETRY_WAIT_MS: u64 = 500;
@@ -24,6 +25,17 @@ const RETRY_WAIT_MS: u64 = 500;
 // Each tx has less than 10KB, so the cache size should be acceptable.
 const BROADCAST_CHANNEL_CAPACITY: usize = 25000;
 const CATCH_UP_END_GAP: u64 = 10;
+
+/// Errors while handle data
+#[derive(Error, Debug)]
+pub enum HandleDataError {
+    /// Sequence Error
+    #[error("transaction seq is great than expected, expect block number {0}")]
+    SeqError(u64),
+    /// Other Errors
+    #[error("{0}")]
+    CommonError(#[from] anyhow::Error),
+}
 
 #[derive(Clone, Debug)]
 pub enum LogSyncEvent {
@@ -103,16 +115,7 @@ impl LogSyncManager {
                     };
 
                     let (mut start_block_number, mut start_block_hash) =
-                        match log_sync_manager.store.get_sync_progress()? {
-                            // No previous progress, so just use config.
-                            None => {
-                                let block_number = log_sync_manager.config.start_block_number;
-                                let block_hash =
-                                    log_sync_manager.get_block(block_number.into()).await?.1;
-                                (block_number, block_hash)
-                            }
-                            Some((block_number, block_hash)) => (block_number, block_hash),
-                        };
+                        get_start_block_number_with_hash(&log_sync_manager).await?;
 
                     let (mut finalized_block_number, mut finalized_block_hash) =
                         match log_sync_manager.get_block(BlockNumber::Finalized).await {
@@ -146,7 +149,7 @@ impl LogSyncManager {
                             &executor_clone,
                             log_sync_manager.block_hash_cache.clone(),
                         );
-                        log_sync_manager.handle_data(reorg_rx).await?;
+                        log_sync_manager.handle_data(reorg_rx, &None).await?;
                         if let Some((block_number, block_hash)) =
                             log_sync_manager.store.get_sync_progress()?
                         {
@@ -198,13 +201,51 @@ impl LogSyncManager {
                     } else {
                         // Keep catching-up data until we are close to the latest height.
                         loop {
-                            log_sync_manager
+                            // wait tx receipt is ready
+                            if let Ok(Some(block)) = log_sync_manager
+                                .log_fetcher
+                                .provider()
+                                .get_block_with_txs(finalized_block_number)
+                                .await
+                            {
+                                if let Some(tx) = block.transactions.first() {
+                                    loop {
+                                        match log_sync_manager
+                                            .log_fetcher
+                                            .provider()
+                                            .get_transaction_receipt(tx.hash)
+                                            .await
+                                        {
+                                            Ok(Some(_)) => break,
+                                            _ => {
+                                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            while let Err(e) = log_sync_manager
                                 .catch_up_data(
                                     executor_clone.clone(),
                                     start_block_number,
                                     finalized_block_number,
                                 )
-                                .await?;
+                                .await
+                            {
+                                match e {
+                                    HandleDataError::SeqError(block_number) => {
+                                        warn!("seq error occurred, retry from {}", block_number);
+                                        start_block_number = block_number;
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                    }
+                                    _ => {
+                                        return Err(e.into());
+                                    }
+                                }
+                            }
+
                             start_block_number = finalized_block_number.saturating_add(1);
 
                             let new_finalized_block =
@@ -223,15 +264,32 @@ impl LogSyncManager {
                         warn!("catch_up_end send fails, possibly auto_sync is not enabled");
                     }
 
+                    log_sync_manager
+                        .log_fetcher
+                        .start_remove_finalized_block_task(
+                            &executor_clone,
+                            log_sync_manager.store.clone(),
+                            log_sync_manager.block_hash_cache.clone(),
+                            log_sync_manager.config.default_finalized_block_count,
+                            log_sync_manager
+                                .config
+                                .remove_finalized_block_interval_minutes,
+                        );
+
+                    let (watch_progress_tx, watch_progress_rx) =
+                        tokio::sync::mpsc::unbounded_channel();
                     let watch_rx = log_sync_manager.log_fetcher.start_watch(
                         start_block_number,
                         parent_block_hash,
                         &executor_clone,
                         log_sync_manager.block_hash_cache.clone(),
                         log_sync_manager.config.watch_loop_wait_time_ms,
+                        watch_progress_rx,
                     );
                     // Syncing `watch_rx` is supposed to block forever.
-                    log_sync_manager.handle_data(watch_rx).await?;
+                    log_sync_manager
+                        .handle_data(watch_rx, &Some(watch_progress_tx))
+                        .await?;
                     Ok::<(), anyhow::Error>(())
                 },
             )
@@ -241,20 +299,20 @@ impl LogSyncManager {
         Ok((event_send_cloned, catch_up_end_receiver))
     }
 
-    async fn put_tx(&mut self, tx: Transaction) -> bool {
+    async fn put_tx(&mut self, tx: Transaction) -> Option<bool> {
         // We call this after process chain reorg, so the sequence number should match.
         match tx.seq.cmp(&self.next_tx_seq) {
-            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Less => Some(true),
             std::cmp::Ordering::Equal => {
                 debug!("log entry sync get entry: {:?}", tx);
-                self.put_tx_inner(tx).await
+                Some(self.put_tx_inner(tx).await)
             }
             std::cmp::Ordering::Greater => {
                 error!(
                     "Unexpected transaction seq: next={} get={}",
                     self.next_tx_seq, tx.seq
                 );
-                false
+                None
             }
         }
     }
@@ -296,9 +354,20 @@ impl LogSyncManager {
         let _ = self.event_send.send(LogSyncEvent::Reverted { tx_seq });
     }
 
-    async fn handle_data(&mut self, mut rx: UnboundedReceiver<LogFetchProgress>) -> Result<()> {
+    async fn handle_data(
+        &mut self,
+        mut rx: UnboundedReceiver<LogFetchProgress>,
+        watch_progress_tx: &Option<UnboundedSender<u64>>,
+    ) -> Result<(), HandleDataError> {
+        let mut log_latest_block_number =
+            if let Some(block_number) = self.store.get_log_latest_block_number()? {
+                block_number
+            } else {
+                0
+            };
+
         while let Some(data) = rx.recv().await {
-            trace!("handle_data: data={:?}", data);
+            debug!("handle_data: data={:?}", data);
             match data {
                 LogFetchProgress::SyncedBlock((
                     block_number,
@@ -336,11 +405,34 @@ impl LogSyncManager {
                         }
                     }
                 }
-                LogFetchProgress::Transaction(tx) => {
-                    if !self.put_tx(tx.clone()).await {
+                LogFetchProgress::Transaction((tx, block_number)) => {
+                    let mut stop = false;
+                    match self.put_tx(tx.clone()).await {
+                        Some(false) => stop = true,
+                        Some(true) => {
+                            if let Err(e) = self.store.put_log_latest_block_number(block_number) {
+                                warn!("failed to put log latest block number, error={:?}", e);
+                            }
+
+                            log_latest_block_number = block_number;
+                        }
+                        _ => {
+                            stop = true;
+                            if let Some(progress_tx) = watch_progress_tx {
+                                if let Err(e) = progress_tx.send(log_latest_block_number) {
+                                    error!("failed to send watch progress, error={:?}", e);
+                                } else {
+                                    continue;
+                                }
+                            } else {
+                                return Err(HandleDataError::SeqError(log_latest_block_number));
+                            }
+                        }
+                    }
+
+                    if stop {
                         // Unexpected error.
-                        error!("log sync write error");
-                        break;
+                        return Err(anyhow!("log sync write error").into());
                     }
                     if let Err(e) = self.event_send.send(LogSyncEvent::TxSynced { tx }) {
                         // TODO: Do we need to wait until all receivers are initialized?
@@ -358,7 +450,11 @@ impl LogSyncManager {
     }
 
     async fn put_tx_inner(&mut self, tx: Transaction) -> bool {
-        if let Err(e) = self.store.put_tx(tx.clone()) {
+        let start_time = Instant::now();
+        let result = self.store.put_tx(tx.clone());
+        metrics::STORE_PUT_TX.update_since(start_time);
+
+        if let Err(e) = result {
             error!("put_tx error: e={:?}", e);
             false
         } else {
@@ -415,7 +511,7 @@ impl LogSyncManager {
         executor_clone: TaskExecutor,
         start_block_number: u64,
         finalized_block_number: u64,
-    ) -> Result<()> {
+    ) -> Result<(), HandleDataError> {
         if start_block_number < finalized_block_number {
             let recover_rx = self.log_fetcher.start_recover(
                 start_block_number,
@@ -423,18 +519,50 @@ impl LogSyncManager {
                 &executor_clone,
                 Duration::from_millis(self.config.recover_query_delay),
             );
-            self.handle_data(recover_rx).await?;
+            self.handle_data(recover_rx, &None).await?;
         }
-
-        self.log_fetcher.start_remove_finalized_block_task(
-            &executor_clone,
-            self.store.clone(),
-            self.block_hash_cache.clone(),
-            self.config.default_finalized_block_count,
-            self.config.remove_finalized_block_interval_minutes,
-        );
         Ok(())
     }
+}
+
+async fn get_start_block_number_with_hash(
+    log_sync_manager: &LogSyncManager,
+) -> Result<(u64, H256), anyhow::Error> {
+    if log_sync_manager
+        .config
+        .force_log_sync_from_start_block_number
+    {
+        let block_number = log_sync_manager.config.start_block_number;
+        let block_hash = log_sync_manager.get_block(block_number.into()).await?.1;
+        return Ok((block_number, block_hash));
+    }
+
+    if let Some(block_number) = log_sync_manager.store.get_log_latest_block_number()? {
+        if let Some(Some(val)) = log_sync_manager
+            .block_hash_cache
+            .read()
+            .await
+            .get(&block_number)
+        {
+            return Ok((block_number, val.block_hash));
+        } else {
+            warn!("get block hash for block {} from RPC", block_number);
+            let block_hash = log_sync_manager.get_block(block_number.into()).await?.1;
+            return Ok((block_number, block_hash));
+        }
+    }
+
+    let (start_block_number, start_block_hash) = match log_sync_manager.store.get_sync_progress()? {
+        // No previous progress, so just use config.
+        None => {
+            let block_number = log_sync_manager.config.start_block_number;
+            let block_hash = log_sync_manager.get_block(block_number.into()).await?.1;
+            (block_number, block_hash)
+        }
+        Some((block_number, block_hash)) => (block_number, block_hash),
+    };
+
+    Ok((start_block_number, start_block_hash))
 }
 
 async fn run_and_log<R, E>(
@@ -458,3 +586,4 @@ pub(crate) mod config;
 mod data_cache;
 mod log_entry_fetcher;
 mod log_query;
+mod metrics;

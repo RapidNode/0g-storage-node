@@ -75,7 +75,11 @@ impl MineRangeConfig {
         let minable_length =
             (context.flow_length.as_u64() / SECTORS_PER_LOAD as u64) * SECTORS_PER_LOAD as u64;
 
-        let mining_length = std::cmp::min(minable_length, SECTORS_PER_MAX_MINING_RANGE as u64);
+        let num_shards = 1u64 << self.shard_config.miner_shard_mask().count_zeros();
+        let mining_length = std::cmp::min(
+            minable_length,
+            (SECTORS_PER_MAX_MINING_RANGE as u64).saturating_mul(num_shards),
+        );
 
         let start_position = std::cmp::min(self_start_position, minable_length - mining_length);
         let start_position =
@@ -94,12 +98,12 @@ impl MineRangeConfig {
         let self_start_position = self.start_position?;
         let self_end_position = self.end_position?;
 
-        if self.start_position >= self.end_position {
+        if self_start_position >= self_end_position {
             return Some(false);
         }
         Some(
             self_start_position <= recall_position + SECTORS_PER_LOAD as u64
-                || self_end_position > recall_position,
+                && self_end_position > recall_position,
         )
     }
 }
@@ -206,7 +210,7 @@ impl PoraService {
                     let timer = time::Instant::now();
 
                     if let Some(answer) = miner.batch_iteration(nonce, self.iter_batch).await {
-                        debug!("Hit Pora answer {:?}", answer);
+                        info!("Hit Pora answer {:?}", answer);
                         if self.mine_answer_sender.send(answer).is_err() {
                             warn!("Mine submitter channel closed");
                         }
@@ -236,6 +240,10 @@ impl PoraService {
 
         if puzzle.max_shards() < self.mine_range.shard_config.num_shard as u64 {
             return Err("too many mine shards");
+        }
+
+        if puzzle.context.flow_length <= U256::one() {
+            return Err("no data submitted");
         }
 
         if self.mine_range.shard_config.num_shard as u64 > puzzle.context.flow_length.as_u64() {

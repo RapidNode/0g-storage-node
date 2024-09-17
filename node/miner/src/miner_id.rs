@@ -37,6 +37,7 @@ pub(crate) async fn check_and_request_miner_id(
                     d_id, c_id
                 ))
             } else {
+                check_miner_id(&mine_contract, d_id).await?;
                 Ok(d_id)
             }
         }
@@ -99,7 +100,7 @@ async fn request_miner_id(
         .retries(3)
         .await
         .map_err(|e| format!("Fail to execute mine answer transaction: {:?}", e))?
-        .ok_or("Request miner id transaction dropped after 3 retires")?;
+        .ok_or("Request miner id transaction dropped after 3 retries")?;
 
     let first_log = receipt
         .logs

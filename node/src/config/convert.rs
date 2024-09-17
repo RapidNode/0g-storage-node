@@ -8,7 +8,7 @@ use miner::MinerConfig;
 use network::NetworkConfig;
 use pruner::PrunerConfig;
 use rpc::RPCConfig;
-use shared_types::NetworkIdentity;
+use shared_types::{NetworkIdentity, ProtocolVersion};
 use std::net::IpAddr;
 use std::time::Duration;
 use storage::config::ShardConfig;
@@ -41,6 +41,11 @@ impl ZgsConfig {
         network_config.network_id = NetworkIdentity {
             chain_id,
             flow_address,
+            p2p_protocol_version: ProtocolVersion {
+                major: network::PROTOCOL_VERSION[0],
+                minor: network::PROTOCOL_VERSION[1],
+                build: network::PROTOCOL_VERSION[2],
+            },
         };
 
         if !self.network_disable_discovery {
@@ -151,6 +156,7 @@ impl ZgsConfig {
             self.default_finalized_block_count,
             self.remove_finalized_block_interval_minutes,
             self.watch_loop_wait_time_ms,
+            self.force_log_sync_from_start_block_number,
         ))
     }
 
@@ -185,6 +191,7 @@ impl ZgsConfig {
         let submission_gas = self.miner_submission_gas.map(U256::from);
         let cpu_percentage = self.miner_cpu_percentage;
         let iter_batch = self.mine_iter_batch_size;
+        let context_query_seconds = self.mine_context_query_seconds;
 
         let shard_config = self.shard_config()?;
 
@@ -197,6 +204,7 @@ impl ZgsConfig {
             submission_gas,
             cpu_percentage,
             iter_batch,
+            context_query_seconds,
             shard_config,
             self.rate_limit_retries,
             self.timeout_retries,
@@ -246,6 +254,6 @@ impl ZgsConfig {
     }
 
     fn shard_config(&self) -> Result<ShardConfig, String> {
-        ShardConfig::new(&self.shard_position)
+        self.shard_position.clone().try_into()
     }
 }

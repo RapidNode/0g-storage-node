@@ -2,7 +2,10 @@ use super::{
     batcher::{Batcher, SyncResult},
     sync_store::SyncStore,
 };
-use crate::{auto_sync::metrics, Config, SyncSender};
+use crate::{
+    auto_sync::{metrics, sync_store::Queue},
+    Config, SyncSender,
+};
 use anyhow::Result;
 use log_entry_sync::LogSyncEvent;
 use serde::{Deserialize, Serialize};
@@ -23,6 +26,7 @@ use tokio::{
 /// Supports to sync files in sequence concurrently.
 #[derive(Clone)]
 pub struct SerialBatcher {
+    config: Config,
     batcher: Batcher,
 
     /// Next tx seq to sync.
@@ -80,13 +84,17 @@ impl SerialBatcher {
         sync_send: SyncSender,
         sync_store: Arc<SyncStore>,
     ) -> Result<Self> {
-        let capacity = config.max_sequential_workers;
-
         // continue file sync from break point in db
         let (next_tx_seq, max_tx_seq) = sync_store.get_tx_seq_range().await?;
 
         Ok(Self {
-            batcher: Batcher::new(config, capacity, store, sync_send),
+            config,
+            batcher: Batcher::new(
+                config.max_sequential_workers,
+                config.sequential_find_peer_timeout,
+                store,
+                sync_send,
+            ),
             next_tx_seq: Arc::new(AtomicU64::new(next_tx_seq.unwrap_or(0))),
             max_tx_seq: Arc::new(AtomicU64::new(max_tx_seq.unwrap_or(u64::MAX))),
             pending_completed_txs: Default::default(),
@@ -136,7 +144,7 @@ impl SerialBatcher {
             // disable file sync until catched up
             if !catched_up.load(Ordering::Relaxed) {
                 trace!("Cannot sync file in catch-up phase");
-                sleep(self.batcher.config.auto_sync_idle_interval).await;
+                sleep(self.config.auto_sync_idle_interval).await;
                 continue;
             }
 
@@ -157,11 +165,11 @@ impl SerialBatcher {
                         "File sync still in progress or idle, state = {:?}",
                         self.get_state().await
                     );
-                    sleep(self.batcher.config.auto_sync_idle_interval).await;
+                    sleep(self.config.auto_sync_idle_interval).await;
                 }
                 Err(err) => {
                     warn!(%err, "Failed to sync file once, state = {:?}", self.get_state().await);
-                    sleep(self.batcher.config.auto_sync_error_interval).await;
+                    sleep(self.config.auto_sync_error_interval).await;
                 }
             }
         }
@@ -195,7 +203,7 @@ impl SerialBatcher {
         }
 
         // otherwise, mark tx as ready for sync
-        if let Err(err) = self.sync_store.upgrade_tx_to_ready(announced_tx_seq).await {
+        if let Err(err) = self.sync_store.upgrade(announced_tx_seq).await {
             error!(%err, %announced_tx_seq, "Failed to promote announced tx to ready, state = {:?}", self.get_state().await);
         }
 
@@ -257,7 +265,7 @@ impl SerialBatcher {
 
         info!(%tx_seq, ?sync_result, "Completed to sync file, state = {:?}", self.get_state().await);
         match sync_result {
-            SyncResult::Completed => metrics::SEQUENTIAL_SYNC_RESULT_COMPLETED.inc(1),
+            SyncResult::Completed => metrics::SEQUENTIAL_SYNC_RESULT_COMPLETED.mark(1),
             SyncResult::Failed => metrics::SEQUENTIAL_SYNC_RESULT_FAILED.inc(1),
             SyncResult::Timeout => metrics::SEQUENTIAL_SYNC_RESULT_TIMEOUT.inc(1),
         }
@@ -275,9 +283,26 @@ impl SerialBatcher {
 
     /// Schedule file sync in sequence.
     async fn schedule_next(&mut self) -> Result<bool> {
-        let next_tx_seq = self.next_tx_seq.load(Ordering::Relaxed);
-        if next_tx_seq > self.max_tx_seq.load(Ordering::Relaxed) {
+        let max_tx_seq = self.max_tx_seq.load(Ordering::Relaxed);
+        if max_tx_seq == u64::MAX {
             return Ok(false);
+        }
+
+        let mut next_tx_seq = self.next_tx_seq.load(Ordering::Relaxed);
+        if next_tx_seq > max_tx_seq {
+            return Ok(false);
+        }
+
+        // If sequential sync disabled, delegate to random sync.
+        if self.config.max_sequential_workers == 0 {
+            self.sync_store.insert(next_tx_seq, Queue::Ready).await?;
+
+            next_tx_seq += 1;
+            self.sync_store.set_next_tx_seq(next_tx_seq).await?;
+            self.next_tx_seq.store(next_tx_seq, Ordering::Relaxed);
+            self.next_tx_seq_in_db.store(next_tx_seq, Ordering::Relaxed);
+
+            return Ok(true);
         }
 
         if !self.batcher.add(next_tx_seq).await? {
@@ -304,7 +329,7 @@ impl SerialBatcher {
 
             // downgrade to random sync if file sync failed or timeout
             if matches!(sync_result, SyncResult::Failed | SyncResult::Timeout) {
-                self.sync_store.add_pending_tx(current).await?;
+                self.sync_store.insert(current, Queue::Pending).await?;
             }
 
             // always move forward in db

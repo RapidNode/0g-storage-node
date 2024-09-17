@@ -252,7 +252,7 @@ impl LogStoreWrite for LogManager {
                 debug!("recovery with tx_seq={}", tx.seq);
             } else {
                 // This is not supposed to happen since we have checked the tx seq in log entry sync.
-                error!("tx unmatch, expected={} get={:?}", expected_seq, tx);
+                error!("tx mismatch, expected={} get={:?}", expected_seq, tx);
                 bail!("unexpected tx!");
             }
         }
@@ -343,6 +343,10 @@ impl LogStoreWrite for LogManager {
 
     fn put_sync_progress(&self, progress: (u64, H256, Option<Option<u64>>)) -> Result<()> {
         self.tx_store.put_progress(progress)
+    }
+
+    fn put_log_latest_block_number(&self, block_number: u64) -> Result<()> {
+        self.tx_store.put_log_latest_block_number(block_number)
     }
 
     /// Return the reverted Transactions in order.
@@ -534,6 +538,10 @@ impl LogStoreRead for LogManager {
         self.tx_store.get_progress()
     }
 
+    fn get_log_latest_block_number(&self) -> Result<Option<u64>> {
+        self.tx_store.get_log_latest_block_number()
+    }
+
     fn get_block_hash_by_number(&self, block_number: u64) -> Result<Option<(H256, Option<u64>)>> {
         self.tx_store.get_block_hash_by_number(block_number)
     }
@@ -609,9 +617,9 @@ impl LogManager {
                     .get_tx_by_seq_number(last_tx_seq)?
                     .expect("tx missing");
                 let mut current_len = initial_data.leaves();
-                let expected_len = (last_tx.start_entry_index + last_tx.num_entries() as u64)
-                    / PORA_CHUNK_SIZE as u64;
-                match expected_len.cmp(&(current_len as u64)) {
+                let expected_len =
+                    sector_to_segment(last_tx.start_entry_index + last_tx.num_entries() as u64);
+                match expected_len.cmp(&(current_len)) {
                     Ordering::Less => {
                         bail!(
                             "Unexpected DB: merkle tree larger than the known data size,\
@@ -634,10 +642,9 @@ impl LogManager {
                             let previous_tx = tx_store
                                 .get_tx_by_seq_number(last_tx_seq - 1)?
                                 .expect("tx missing");
-                            let expected_len = ((previous_tx.start_entry_index
-                                + previous_tx.num_entries() as u64)
-                                / PORA_CHUNK_SIZE as u64)
-                                as usize;
+                            let expected_len = sector_to_segment(
+                                previous_tx.start_entry_index + previous_tx.num_entries() as u64,
+                            );
                             if current_len > expected_len {
                                 while let Some((subtree_depth, _)) = initial_data.subtree_list.pop()
                                 {
@@ -737,13 +744,13 @@ impl LogManager {
         maybe_tx_seq: Option<u64>,
     ) -> Result<FlowProof> {
         let merkle = self.merkle.read_recursive();
-        let chunk_index = flow_index / PORA_CHUNK_SIZE as u64;
+        let seg_index = sector_to_segment(flow_index);
         let top_proof = match maybe_tx_seq {
-            None => merkle.pora_chunks_merkle.gen_proof(chunk_index as usize)?,
+            None => merkle.pora_chunks_merkle.gen_proof(seg_index)?,
             Some(tx_seq) => merkle
                 .pora_chunks_merkle
                 .at_version(tx_seq)?
-                .gen_proof(chunk_index as usize)?,
+                .gen_proof(seg_index)?,
         };
 
         // TODO(zz): Maybe we can decide that all proofs are at the PoRA chunk level, so
@@ -753,11 +760,11 @@ impl LogManager {
         // and `flow_index` must be within a complete PoRA chunk. For possible future usages,
         // we'll need to find the flow length at the given root and load a partial chunk
         // if `flow_index` is in the last chunk.
-        let sub_proof = if chunk_index as usize != merkle.pora_chunks_merkle.leaves() - 1
+        let sub_proof = if seg_index != merkle.pora_chunks_merkle.leaves() - 1
             || merkle.last_chunk_merkle.leaves() == 0
         {
             self.flow_store
-                .gen_proof_in_batch(chunk_index as usize, flow_index as usize % PORA_CHUNK_SIZE)?
+                .gen_proof_in_batch(seg_index, flow_index as usize % PORA_CHUNK_SIZE)?
         } else {
             match maybe_tx_seq {
                 None => merkle
@@ -769,7 +776,21 @@ impl LogManager {
                     .gen_proof(flow_index as usize % PORA_CHUNK_SIZE)?,
             }
         };
-        entry_proof(&top_proof, &sub_proof)
+        let r = entry_proof(&top_proof, &sub_proof);
+        if r.is_err() {
+            let raw_batch = self.flow_store.get_raw_batch(seg_index as u64)?.unwrap();
+            let db_root = self.flow_store.get_batch_root(seg_index as u64)?;
+            error!(
+                ?r,
+                ?db_root,
+                ?seg_index,
+                "gen proof error: top_leaves={}, last={}, raw_batch={}",
+                merkle.pora_chunks_merkle.leaves(),
+                merkle.last_chunk_merkle.leaves(),
+                serde_json::to_string(&raw_batch).unwrap(),
+            );
+        }
+        r
     }
 
     #[instrument(skip(self, merkle))]
@@ -968,16 +989,16 @@ impl LogManager {
     }
 
     // FIXME(zz): Implement padding.
-    pub fn padding(len: usize) -> Vec<Vec<u8>> {
+    pub fn padding(len: usize) -> Box<dyn Iterator<Item = Vec<u8>>> {
         let remainder = len % PAD_MAX_SIZE;
         let n = len / PAD_MAX_SIZE;
-        let mut pad_data = vec![Self::padding_raw(PAD_MAX_SIZE); n];
+        let iter = (0..n).map(|_| Self::padding_raw(PAD_MAX_SIZE));
         if remainder == 0 {
-            pad_data
+            Box::new(iter)
         } else {
             // insert the remainder to the front, so the rest are processed with alignment.
-            pad_data.insert(0, Self::padding_raw(remainder));
-            pad_data
+            let new_iter = vec![Self::padding_raw(remainder)].into_iter().chain(iter);
+            Box::new(new_iter)
         }
     }
 
@@ -1152,7 +1173,7 @@ pub fn sub_merkle_tree(leaf_data: &[u8]) -> Result<FileMerkleTree> {
 
 pub fn data_to_merkle_leaves(leaf_data: &[u8]) -> Result<Vec<H256>> {
     if leaf_data.len() % ENTRY_SIZE != 0 {
-        bail!("merkle_tree: unmatch data size");
+        bail!("merkle_tree: mismatched data size");
     }
     // If the data size is small, using `rayon` would introduce more overhead.
     let r = if leaf_data.len() >= ENTRY_SIZE * 8 {
@@ -1190,7 +1211,7 @@ fn entry_proof(top_proof: &FlowProof, sub_proof: &FlowProof) -> Result<FlowProof
     assert!(lemma.pop().is_some());
     lemma.extend_from_slice(&top_proof.lemma()[1..]);
     path.extend_from_slice(top_proof.path());
-    Ok(FlowProof::new(lemma, path))
+    FlowProof::new(lemma, path)
 }
 
 pub fn split_nodes(data_size: usize) -> Vec<usize> {
@@ -1235,4 +1256,12 @@ pub fn tx_subtree_root_list_padded(data: &[u8]) -> Vec<(usize, DataRoot)> {
     }
 
     root_list
+}
+
+pub fn sector_to_segment(sector_index: u64) -> usize {
+    (sector_index / PORA_CHUNK_SIZE as u64) as usize
+}
+
+pub fn segment_to_sector(segment_index: usize) -> usize {
+    segment_index * PORA_CHUNK_SIZE
 }

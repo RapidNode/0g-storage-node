@@ -35,6 +35,7 @@ pub struct MineContextWatcher {
 
     mine_context_sender: broadcast::Sender<MineContextMessage>,
     last_report: MineContextMessage,
+    query_interval: Duration,
 
     msg_recv: broadcast::Receiver<MinerMessage>,
 }
@@ -46,8 +47,6 @@ impl MineContextWatcher {
         provider: Arc<MineServiceMiddleware>,
         config: &MinerConfig,
     ) -> broadcast::Receiver<MineContextMessage> {
-        let provider = provider;
-
         let mine_contract = PoraMine::new(config.mine_address, provider.clone());
         let flow_contract = ZgsFlow::new(config.flow_address, provider.clone());
 
@@ -60,6 +59,7 @@ impl MineContextWatcher {
             mine_context_sender,
             msg_recv,
             last_report: None,
+            query_interval: config.context_query_interval,
         };
         executor.spawn(
             async move { Box::pin(watcher.start()).await },
@@ -95,7 +95,7 @@ impl MineContextWatcher {
                 }
 
                 _ = async {}, if mining_enabled && mining_throttle.is_elapsed() => {
-                    mining_throttle.as_mut().reset(Instant::now() + Duration::from_secs(1));
+                    mining_throttle.as_mut().reset(Instant::now() + self.query_interval);
                     if let Err(err) = self.query_recent_context().await {
                         warn!(err);
                     }

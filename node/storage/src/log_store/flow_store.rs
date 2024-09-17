@@ -90,6 +90,14 @@ impl FlowStore {
         }
         self.db.delete_batch_list(batch_list)
     }
+
+    pub fn get_raw_batch(&self, batch_index: u64) -> Result<Option<EntryBatch>> {
+        self.db.get_entry_batch(batch_index)
+    }
+
+    pub fn get_batch_root(&self, batch_index: u64) -> Result<Option<DataRoot>> {
+        self.db.get_batch_root(batch_index)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -195,7 +203,7 @@ impl FlowRead for FlowStore {
         for (seal_index, (sealed, validity)) in mine_chunk
             .loaded_chunk
             .iter_mut()
-            .zip(mine_chunk.avalibilities.iter_mut())
+            .zip(mine_chunk.availabilities.iter_mut())
             .enumerate()
         {
             if let Some(data) = batch.get_sealed_data(seal_index as u16) {
@@ -574,6 +582,16 @@ impl FlowDBStore {
             tx.delete(COL_ENTRY_BATCH, &i.to_be_bytes());
         }
         Ok(self.kvdb.write(tx)?)
+    }
+
+    fn get_batch_root(&self, batch_index: u64) -> Result<Option<DataRoot>> {
+        Ok(self
+            .kvdb
+            .get(
+                COL_ENTRY_BATCH_ROOT,
+                &encode_batch_root_key(batch_index as usize, 1),
+            )?
+            .map(|v| DataRoot::from_slice(&v)))
     }
 }
 
